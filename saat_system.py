@@ -77,6 +77,7 @@ HOW TO RUN
 import argparse
 import json
 import queue
+import random
 import sqlite3
 import threading
 import time
@@ -112,98 +113,203 @@ except ImportError:
     HAVE_SERVOKIT = False
 
 try:
-    from flask import Flask, jsonify, render_template_string
+    from flask import Flask, jsonify, render_template_string, Response
     HAVE_FLASK = True
 except ImportError:
     HAVE_FLASK = False
 
 
-# ==============================================================================
-# CONFIG  -  every numeric value below is taken verbatim from the documentation
-# (docx sections/tables cited in the comments); nothing here is a placeholder.
-# ==============================================================================
+########################################################################################
+#
+#   >>>>>>>>>>>>>>>>>>>>>>>>>>>>  CONTROL PANEL  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+#
+#   Every value that governs the behaviour of this system lives in ONE place:
+#   the CONFIG dict below (plus SHAPE_GATE and RUNTIME_DEFAULTS right after it).
+#   Nothing that affects behaviour is hardcoded further down in the file - if
+#   you want to change how the system acts, this is the only section you
+#   should need to touch. Each block below is grouped by subsystem and cites
+#   the documentation section/table it comes from, and flags whether it is a
+#   MEASURED/DOCUMENTED value (safe to trust) or a RIG-SPECIFIC value you
+#   must calibrate for your own physical setup (marked "<-- CALIBRATE").
+#
+########################################################################################
+
 ZONE_ORDER = ["A1", "A2", "A3", "B1", "B2", "B3"]          # Sections 4.2 / 14.1
-MOTOR_CHANNEL = {"A1": 0, "A2": 1, "A3": 2, "B1": 3, "B2": 4, "B3": 5}  # servos_testing.py
+MOTOR_CHANNEL = {"A1": 0, "A2": 1, "A3": 2, "B1": 3, "B2": 4, "B3": 5}  # PCA9685 channels, servos_testing.py
 
 CONFIG = {
-    # --- Section 3 / Table 1: camera --------------------------------------
+
+    # ==========================================================================
+    # 1) CAMERA  -  Section 3 / Table 1
+    # ==========================================================================
     "camera": {
-        "color_width": 1280, "color_height": 800, "color_fps": 30,   # practical
-        "depth_width": 1280, "depth_height": 720, "depth_fps": 30,   # RealSense caps
-        "working_distance_mm": 380,        # belt-to-camera, Section 3.1/8.2
+        "color_width": 1280, "color_height": 800, "color_fps": 30,     # <-- CALIBRATE: raise toward 90 Hz only if your D455/USB link can sustain it
+        "depth_width": 1280, "depth_height": 720, "depth_fps": 30,     # <-- CALIBRATE: RealSense depth mode; doc target is 60 Hz
+        "working_distance_mm": 380,        # belt-to-camera height, Section 3.1/8.2  <-- CALIBRATE per gantry leadscrew position
     },
-    # --- Table 3: frame column split (of the raw 1280-wide colour frame) ---
+
+    # ==========================================================================
+    # 2) FRAME LAYOUT  -  Table 3: raw 1280 px-wide colour frame column split
+    # ==========================================================================
     "frame_columns": {"conv1": (0, 256), "vision": (257, 1024), "conv2": (1025, 1280)},
-    # --- calibrated physical belt-zone grid, tuned percentages carried over
-    #     from distances.py / frames_test.py draw_grid() -> re-tune here to
-    #     fit your rig (comment preserved from the original scripts) --------
+
+    # ==========================================================================
+    # 3) ZONE GRID  -  the calibrated 6-zone (A1..B3) grid, carried over from
+    #    distances.py / frames_test.py draw_grid(). THESE ARE THE FIRST NUMBERS
+    #    TO RE-TUNE if the red zone lines don't line up with your physical rig.
+    # ==========================================================================
     "zone_grid": {
-        "crop_x1": 180, "crop_x2": 1030, "crop_y1": 0, "crop_y2": 800,
-        "top_margin_pct": 0.08,     # C1 boundary (pear entry line, t1)
-        "mid_y_pct": 0.52,          # Row A / Row B divider
-        "bottom_margin_pct": 0.95,  # C2 boundary (pear exit line, t2)
-        "vert_left_pct": 0.30,      # lane 1 / lane 2 divider
-        "vert_right_pct": 0.63,     # lane 2 / lane 3 divider
+        "crop_x1": 180, "crop_x2": 1030, "crop_y1": 0, "crop_y2": 800,   # <-- CALIBRATE: outer belt crop
+        "top_margin_pct": 0.08,     # C1 boundary / pear entry line, t1        <-- CALIBRATE
+        "mid_y_pct": 0.52,          # Row A / Row B divider                    <-- CALIBRATE
+        "bottom_margin_pct": 0.95,  # C2 boundary / pear exit line, t2         <-- CALIBRATE
+        "vert_left_pct": 0.30,      # lane 1 / lane 2 divider                  <-- CALIBRATE
+        "vert_right_pct": 0.63,     # lane 2 / lane 3 divider                  <-- CALIBRATE
     },
-    "zone_row_spacing_m": 0.15,     # design value: physical A-row -> B-row distance
-    # --- Section 6 / Table 30 (final, production row): infection detection -
+    "zone_row_spacing_m": 0.15,     # physical A-row -> B-row distance         <-- CALIBRATE (measure on the rig)
+
+    # ==========================================================================
+    # 4) VISION / INFECTION DETECTION  -  Section 6 / Table 30 (production row)
+    # ==========================================================================
     "vision": {
-        "min_pear_area_px": 800,
-        "infection_ratio_threshold": 0.05,          # Section 9: REJECT if > 5%
-        "infection_hsv_lo": (0, 0, 0),
-        "infection_hsv_hi": (180, 150, 80),          # dark/low-value blemish band
-        "clahe_clip": 2.0, "clahe_tile": (8, 8),
-        "bilateral_d": 9, "bilateral_sigma": 75,
+        "min_pear_area_px": 800,                     # ignore contours smaller than this (noise) <-- CALIBRATE
+        "infection_ratio_threshold": 0.05,            # Section 9: REJECT if infection_ratio > this (5%)
+        "infection_hsv_lo": (0, 0, 0),                # dark/low-value blemish band, lower HSV bound
+        "infection_hsv_hi": (180, 150, 80),           # dark/low-value blemish band, upper HSV bound  <-- CALIBRATE to your lighting
+        "clahe_clip": 2.0, "clahe_tile": (8, 8),       # CLAHE contrast enhancement (step 3 of 9)
+        "bilateral_d": 9, "bilateral_sigma": 75,       # bilateral filter smoothing (step 4 of 9)
+        "morph_kernel_size": 5,                        # morphological open/close kernel, px (step 6 of 9)
     },
-    "big_small_threshold_px2": 15000,               # Section 8.6
-    # --- Section 8.4: mass regression --------------------------------------
-    "mass_model": {"density_g_cm3": 0.960, "intercept_g": -0.02},
-    # calibration constant translating one silhouette pixel into mm^2 of real
-    # belt area at the fixed 380 mm working distance (Section 8.2 pinhole
-    # relation, pre-computed for this rig's focal length -> derived constant)
-    "px_to_mm2": 0.070,
-    # --- Section 10 / Table 15: PID gains (Conv1, Conv2, Servo loops) ------
-    "pid_conv1": {"kp": 0.16, "ki": 11.76, "kd": 0.020},
-    "pid_conv2": {"kp": 0.14, "ki": 15.45, "kd": 0.015},
-    "pid_servo": {"kp": 0.07, "ki": 11.12, "kd": 0.010},
-    "max_ref_speed_ms": 0.5,
-    # --- Section 11 / Table 18: PWM -> LPF -> PLC --------------------------
+    "big_small_threshold_px2": 15000,               # Section 8.6: BIG/SMALL category cutoff
+
+    # ==========================================================================
+    # 5) SHAPE / SECOND-OPINION GATE  -  Section 19.3 / Table 29. Stands in for
+    #    the (untrained) TensorFlow classifier of Section 7, AND-fused with the
+    #    classical infection check per Section 7.1.
+    # ==========================================================================
+    "shape_gate": {
+        "aspect_ratio": (1.1, 2.5),
+        "extent": (0.5, 0.9),
+        "solidity_min": 0.85,
+        "circularity": (0.4, 0.9),
+        "min_checks_passed": 3,   # out of 4 checks must pass to call it "a pear"
+    },
+
+    # ==========================================================================
+    # 6) MASS / VOLUME MODEL  -  Section 8.2-8.4
+    # ==========================================================================
+    "mass_model": {"density_g_cm3": 0.960, "intercept_g": -0.02},   # Mass_g = density*Volume_cm3 + intercept
+    "px_to_mm2": 0.070,   # 1 silhouette pixel -> mm^2 of real belt area at 380 mm  <-- CALIBRATE for your D455's focal length
+
+    # ==========================================================================
+    # 7) SPEED CONTROL  -  Section 10 / Table 15 (PID gains) + Section 10.4
+    # ==========================================================================
+    "pid_conv1": {"kp": 0.16, "ki": 11.76, "kd": 0.020},   # Conv1 (175 cm loading belt)
+    "pid_conv2": {"kp": 0.14, "ki": 15.45, "kd": 0.015},   # Conv2 (115 cm packing belt)
+    "pid_servo": {"kp": 0.07, "ki": 11.12, "kd": 0.010},   # servo return-delay loop (reserved for future use)
+    "max_ref_speed_ms": 0.5,          # Section 10.4 cap on the computed reference speed
+    "speed_control": {
+        "loop_dt_s": 0.1,             # PID/PWM update period, 10 Hz per Section 10.3
+        "pid_trim_gain": 0.01,        # how strongly the PID correction nudges the target voltage  <-- TUNE for your motors
+    },
+    "max_pears_in_vision_zone": 6,    # Section 18 hard capacity limit -> CROWDED/overflow mode
+
+    # ==========================================================================
+    # 8) CONVEYOR VOLTAGE / PWM  -  Section 11 / Table 18: PWM -> LPF -> PLC
+    # ==========================================================================
     "speed_publisher": {
-        "gpio_pin_conv1": 11,     # physical pin 11 / GPIO17 (Table 2/26)
-        "gpio_pin_conv2": 13,     # physical pin 13 / GPIO27
+        "gpio_pin_conv1": 11,     # physical pin 11 / GPIO17 (Table 2/26)        <-- CALIBRATE to your wiring
+        "gpio_pin_conv2": 13,     # physical pin 13 / GPIO27                     <-- CALIBRATE to your wiring
         "pwm_frequency_hz": 500,
-        "min_voltage": 0.1,       # Section 18.1: never true 0 V
+        "min_voltage": 0.1,       # Section 18.1: never true 0 V (PLC would read it as a fault)
         "max_voltage": 3.3,
-        "lpf_r_ohm": 10_000, "lpf_c_f": 10e-6,   # Table 18 -> fc ~= 1.59 Hz
+        "lpf_r_ohm": 10_000, "lpf_c_f": 10e-6,   # external RC low-pass filter (real hardware, not code) -> fc ~= 1.59 Hz
     },
-    # --- Section 12 / Table 19: servo actuation ----------------------------
+
+    # ==========================================================================
+    # 9) SERVO ACTUATION  -  Section 12 / Table 19
+    # ==========================================================================
     "servo": {
-        "accept_angle": 0.0, "reject_angle": 90.0,
+        "angle_rejected": 0.0, 
+        "angle_home": 80.0, 
+        "angle_accepted": 175.0,
         "return_delay_s": 0.4,
-        "pulse_min_us": 1000, "pulse_max_us": 2000,
+        "pulse_min_us": 500,           
+        "pulse_max_us": 2500,          
         "pwm_freq_hz": 50,
-        "occupancy_cooldown_s": 3.0,   # Section 19.5.5 debounce
+        "occupancy_cooldown_s": 3.0,
+
     },
-    # --- Section 15.3 / Figure 15.2: packaging -----------------------------
+
+    # ==========================================================================
+    # 10) LIVE CAMERA VIEW  -  "what the camera sees / what it does": streams
+    #     the annotated colour feed to the dashboard at /camera (/video_feed)
+    # ==========================================================================
+    "camera_stream": {
+        "enabled": True,
+        "target_fps": 10,             # how often a new overlay frame is composited/streamed
+        "jpeg_quality": 75,           # 0-100, higher = sharper but more bandwidth
+        "show_zone_grid": True,
+        "show_status_banner": True,
+    },
+
+    # ==========================================================================
+    # 11) PACKAGING  -  Section 15.3 / Figure 15.2
+    # ==========================================================================
     "packaging": {"big_per_package": 12, "small_per_package": 12, "company_name": "SAAT"},
-    # --- Section 14.3: 0.1 Hz IoT publish -----------------------------------
-    "iot_publish_period_s": 10.0,
-    # --- Section 18 hard limit ----------------------------------------------
-    "max_pears_in_vision_zone": 6,
-    # --- Section 13 / Table 20: 1-second action-cycle timing budget --------
-    "action_cycle_budget_s": 1.0,
+
+    # ==========================================================================
+    # 12) TIMING / POLLING  -  Section 13 loop cadences and the 1 s cycle budget
+    # ==========================================================================
+    "iot_publish_period_s": 10.0,        # Section 14.3: 0.1 Hz cloud/dashboard publish
+    "action_cycle_budget_s": 1.0,        # Section 13: hard 1-second action-cycle deadline
+    "timing": {
+        "zone_poll_interval_s": 0.02,    # how often each zone thread re-checks its crop for a pear
+        "idle_sleep_s": 0.05,            # sleep when a loop finds no new work (camera/db threads)
+    },
+
+    # ==========================================================================
+    # 13) DEV / OFFLINE SIMULATION MODE  -  only used when no RealSense camera
+    #     is detected (or --force-sim is passed); controls the synthetic pears
+    #     used to exercise the pipeline without physical hardware attached.
+    # ==========================================================================
+    "dev_mode": {
+        "spawn_probability_per_frame": 0.02,
+        "max_concurrent_sim_pears": 5,
+        "pear_radius_px_range": (45, 70),
+        "infection_probability": 0.30,
+        "belt_fall_speed_px_per_frame": 6.0,
+        "random_seed": 42,
+    },
+
+    # ==========================================================================
+    # 14) DASHBOARD  -  Section 15 SCADA web publisher (Flask, port 8080)
+    # ==========================================================================
+    "dashboard": {
+        "colors": {"bg": "#0d1117", "surface": "#161b22", "border": "#30363d",
+                   "green": "#00ff88", "amber": "#f59e0b", "red": "#ef4444", "blue": "#3b82f6"},
+        "auto_refresh_s": 10,            # status-page <meta refresh>, matches iot_publish_period_s
+        "database_rows_shown": 200,
+    },
 }
 
-# Section 19.3 / Table 29: shape+colour "is this a pear" gate thresholds,
-# used here as the second, independent vote that is AND-fused with the
-# classical infection decision (Section 7.1), standing in for the
-# TensorFlow classifier that requires a trained model not supplied here.
-SHAPE_GATE = {
-    "aspect_ratio": (1.1, 2.5),
-    "extent": (0.5, 0.9),
-    "solidity_min": 0.85,
-    "circularity": (0.4, 0.9),
-    "min_checks_passed": 3,   # out of 4
+# Convenience alias so `SHAPE_GATE` keeps working anywhere it's referenced
+# directly (it now lives inside CONFIG, section 5 above, as the single
+# source of truth - edit it there).
+SHAPE_GATE = CONFIG["shape_gate"]
+
+########################################################################################
+# RUNTIME DEFAULTS  -  the default value of every command-line flag (main()'s
+# argparse). Change these if you want a different out-of-the-box behaviour
+# without having to type flags every time; every one of these can still be
+# overridden on the command line (--port, --db-path, etc).
+########################################################################################
+RUNTIME_DEFAULTS = {
+    "port": 8080,
+    "no_web": False,
+    "duration": 0.0,          # 0 = run until Ctrl+C
+    "db_path": "./saat_data/saat_records.db",
+    "force_sim": False,
 }
 
 
@@ -420,6 +526,30 @@ class PID:
 # real external hardware (R = 10 kOhm, C = 10 uF -> fc ~= 1.59 Hz, Table 18)
 # that must be wired between the GPIO pin and the PLC analog input.
 # ==============================================================================
+_gpio_mode_lock = threading.Lock()
+_gpio_mode_ready = False
+
+def _ensure_gpio_mode():
+    """Jetson.GPIO.setmode()/setwarnings() are process-global and may only be
+    called ONCE - calling it again (even with the same mode) from a second
+    VoltageChannel raises 'A different mode has already been set!'. This
+    guard makes sure it only ever runs a single time, no matter how many
+    VoltageChannel instances are created."""
+    global _gpio_mode_ready
+    with _gpio_mode_lock:
+        if not _gpio_mode_ready:
+            GPIO.setwarnings(False)
+            
+            # --- FIX: Clear Adafruit Blinka's conflicting mode lock ---
+            current_mode = GPIO.getmode()
+            if current_mode is not None and current_mode != GPIO.BOARD:
+                GPIO.cleanup()
+            # ----------------------------------------------------------
+            
+            GPIO.setmode(GPIO.BOARD)
+            _gpio_mode_ready = True
+
+
 class VoltageChannel:
     def __init__(self, pin: int, freq_hz: float, max_voltage: float, label: str):
         self.pin = pin
@@ -430,8 +560,7 @@ class VoltageChannel:
         self._lock = threading.Lock()
         self._running = True
         if HAVE_GPIO:
-            GPIO.setwarnings(False)
-            GPIO.setmode(GPIO.BOARD)
+            _ensure_gpio_mode()
             GPIO.setup(self.pin, GPIO.OUT)
         else:
             print(f"[VoltageChannel:{label}] Jetson.GPIO not available - "
@@ -480,6 +609,7 @@ class VoltageChannel:
 # SERVO CONTROLLER  -  generalisation of servo_gui.py / servos_testing.py.
 # Six MG995 servos (A1..B3) on one PCA9685, channels 0-5 (Section 12/Table 19).
 # ==============================================================================
+
 class ServoController:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -490,13 +620,14 @@ class ServoController:
                 self.kit = ServoKit(channels=16)
                 for ch in MOTOR_CHANNEL.values():
                     self.kit.servo[ch].set_pulse_width_range(cfg["pulse_min_us"], cfg["pulse_max_us"])
-                print("[ServoController] PCA9685 initialised, pulse widths calibrated.")
+                    # Initialize aggressively to the HOME position
+                    self.kit.servo[ch].angle = cfg["angle_home"]
+                print("[ServoController] PCA9685 initialised, all servos snapped to HOME (80 deg).")
             except Exception as e:
                 print(f"[ServoController] Hardware error: {e}. Falling back to offline mode.")
                 self.hardware_active = False
         else:
-            print("[ServoController] adafruit_servokit not available - offline mode "
-                  "(servo moves will be logged, not executed).")
+            print("[ServoController] adafruit_servokit not available - offline mode.")
 
     def set_angle(self, zone: str, angle: float):
         channel = MOTOR_CHANNEL[zone]
@@ -507,13 +638,44 @@ class ServoController:
                 print(f"[servo:sim] {zone} (ch {channel}) -> {angle:.0f} deg")
 
     def dispatch(self, zone: str, accepted: bool):
-        """Section 12: only the ACTION_NODE for this zone may move hardware."""
-        if accepted:
-            self.set_angle(zone, self.cfg["accept_angle"])
-        else:
-            self.set_angle(zone, self.cfg["reject_angle"])
-            time.sleep(self.cfg["return_delay_s"])
-            self.set_angle(zone, self.cfg["accept_angle"])
+        """Triggers the cascaded series sequence based on the A-row detection."""
+        
+        # Since A and B are linked in series, we only trigger the physical sequence 
+        # when the A-zone detects the pear. We ignore independent B-zone triggers.
+        if zone.startswith("B"):
+            return
+            
+        # Extract the lane number ('1', '2', or '3') to pair A and B together
+        lane_num = zone[1] 
+        zone_a = f"A{lane_num}"
+        zone_b = f"B{lane_num}"
+        
+        # Launch the sequence in a background thread to avoid blocking the vision pipeline
+        threading.Thread(
+            target=self._series_move_sequence, 
+            args=(zone_a, zone_b, accepted), 
+            daemon=True
+        ).start()
+
+    def _series_move_sequence(self, zone_a: str, zone_b: str, accepted: bool):
+        target_angle = self.cfg["angle_accepted"] if accepted else self.cfg["angle_rejected"]
+        
+        # Step 1: A moves to target. B is explicitly held at Home.
+        self.set_angle(zone_a, target_angle)
+        self.set_angle(zone_b, self.cfg["angle_home"])
+        
+        # Step 2: Delay 0.5s while A is operating
+        time.sleep(0.5)
+        
+        # Step 3: A returns Home. B moves to target.
+        self.set_angle(zone_a, self.cfg["angle_home"])
+        self.set_angle(zone_b, target_angle)
+        
+        # Step 4: Wait for the pear to clear the B gate
+        time.sleep(self.cfg["return_delay_s"])
+        
+        # Step 5: B returns Home, resetting the lane
+        self.set_angle(zone_b, self.cfg["angle_home"])
 
 
 # ==============================================================================
@@ -535,14 +697,78 @@ def zone_rectangles(crop_w: int, crop_h: int, grid_cfg: dict):
     return rects
 
 
-def draw_zone_overlay(img, rects):
-    """Debug/HMI overlay - red grid lines + zone labels, same look as
-    distances.py / frames_test.py's draw_grid()."""
+ZONE_STATUS_COLOR_BGR = {
+    "IDLE": (140, 140, 140),
+    "ACCEPTED": (0, 220, 0),
+    "REJECTED": (0, 0, 230),
+}
+
+
+def draw_zone_overlay(img, rects, motors_status=None):
+    """Debug/HMI overlay - zone grid lines + labels, colour-coded by each
+    zone's last decision (grey=idle, green=accepted, red=rejected) so the
+    live feed shows both what the camera sees AND what the system decided."""
+    status_by_zone = {m["zone"]: m for m in (motors_status or [])}
     for zone, (x1, y1, x2, y2) in rects.items():
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(img, zone, (x1 + 6, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (0, 255, 255), 2, cv2.LINE_AA)
+        m = status_by_zone.get(zone)
+        last_action = m["last_action"] if m else "IDLE"
+        active = m["active"] if m else False
+        color = ZONE_STATUS_COLOR_BGR.get(last_action, ZONE_STATUS_COLOR_BGR["IDLE"])
+        thickness = 4 if active else 2
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        label = f"{zone}: {last_action}" if last_action != "IDLE" else zone
+        cv2.putText(img, label, (x1 + 6, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 255), 2, cv2.LINE_AA)
     return img
+
+
+class VideoStreamBuffer:
+    """Thread-safe holder for the latest JPEG-encoded annotated frame,
+    consumed by the Flask /video_feed MJPEG endpoint."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jpeg_bytes = None
+
+    def set_frame(self, jpeg_bytes: bytes):
+        with self._lock:
+            self._jpeg_bytes = jpeg_bytes
+
+    def get_frame(self):
+        with self._lock:
+            return self._jpeg_bytes
+
+
+def video_stream_node(framebuf: "FrameBuffer", state: "SharedState", rects: dict,
+                       stream_buf: VideoStreamBuffer, stop_event: threading.Event, cfg: dict):
+    """'Let me see what the camera sees, and what it does': continuously
+    composites the live cropped colour frame with the zone grid and each
+    zone's live accept/reject status, JPEG-encodes it, and publishes it to
+    the dashboard's /video_feed. This is purely a viewer - it does not feed
+    back into any decision."""
+    sc = cfg["camera_stream"]
+    if not sc["enabled"]:
+        return
+    period = 1.0 / max(sc["target_fps"], 1)
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), sc["jpeg_quality"]]
+    while not stop_event.is_set():
+        color, _depth, _fid = framebuf.get()
+        if color is None:
+            time.sleep(period)
+            continue
+        frame = color.copy()
+        if sc["show_zone_grid"]:
+            draw_zone_overlay(frame, rects, state.motor_status_array())
+        if sc["show_status_banner"]:
+            banner = (f"ACCEPTED {state.batch_accepted}   REJECTED {state.batch_rejected}   "
+                      f"PACKAGES {state.completed_packages}   IN VISION ZONE {state.active_zone_count()}")
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 34), (20, 20, 20), -1)
+            cv2.putText(frame, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65, (0, 255, 136), 2, cv2.LINE_AA)
+        ok, jpeg = cv2.imencode(".jpg", frame, encode_params)
+        if ok:
+            stream_buf.set_frame(jpeg.tobytes())
+        time.sleep(period)
 
 
 # ==============================================================================
@@ -552,11 +778,13 @@ def draw_zone_overlay(img, rects):
 # and demonstrated without the physical rig attached.
 # ==============================================================================
 class CameraSystem:
-    def __init__(self, cfg):
-        self.cfg = cfg
+    def __init__(self, full_cfg):
+        self.cfg = full_cfg["camera"]
+        self.dev_cfg = full_cfg["dev_mode"]
+        cfg = self.cfg
         self.hardware_active = HAVE_REALSENSE
         self.depth_scale = 0.001   # metres per depth unit, RealSense default
-        self._sim_rng = np.random.default_rng(42)
+        self._sim_rng = random.Random(self.dev_cfg["random_seed"])
         self._sim_pears = []
 
         if self.hardware_active:
@@ -607,15 +835,18 @@ class CameraSystem:
         randomly-placed, randomly-blemished circular 'pears' drifting through
         frame, so the full CV/decision/DB/dashboard pipeline is exercisable
         without the physical rig."""
+        dev = self.dev_cfg
         w, h = self.cfg["color_width"], self.cfg["color_height"]
         color = np.full((h, w, 3), (60, 90, 40), dtype=np.uint8)   # dull belt green
 
-        if self._sim_rng.random() < 0.02 and len(self._sim_pears) < 5:
+        r_lo, r_hi = dev["pear_radius_px_range"]
+        if (self._sim_rng.random() < dev["spawn_probability_per_frame"]
+                and len(self._sim_pears) < dev["max_concurrent_sim_pears"]):
             self._sim_pears.append({
                 "x": float(self._sim_rng.uniform(0.15 * w, 0.85 * w)),
                 "y": -30.0,
-                "r": float(self._sim_rng.uniform(45, 70)),
-                "infected": bool(self._sim_rng.random() < 0.30),
+                "r": float(self._sim_rng.uniform(r_lo, r_hi)),
+                "infected": bool(self._sim_rng.random() < dev["infection_probability"]),
                 "color": (int(self._sim_rng.uniform(30, 70)),
                           int(self._sim_rng.uniform(140, 200)),
                           int(self._sim_rng.uniform(150, 210))),
@@ -628,7 +859,7 @@ class CameraSystem:
 
         survivors = []
         for p in self._sim_pears:
-            p["y"] += 6.0
+            p["y"] += dev["belt_fall_speed_px_per_frame"]
             if p["y"] - p["r"] > h:
                 continue
             survivors.append(p)
@@ -671,7 +902,8 @@ def run_classical_vision(zone_bgr, vcfg):
 
     sat = hsv[:, :, 1]
     _, mask = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = np.ones((5, 5), np.uint8)
+    k = vcfg["morph_kernel_size"]
+    kernel = np.ones((k, k), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
@@ -814,16 +1046,18 @@ def zone_pipeline(zone: str, lane: int, rect, framebuf: FrameBuffer, state: Shar
     last_publish = 0.0
     cooldown = cfg["servo"]["occupancy_cooldown_s"]
     is_row_a = zone.startswith("A")
+    poll_s = cfg["timing"]["zone_poll_interval_s"]
+    idle_s = cfg["timing"]["idle_sleep_s"]
 
     while not stop_event.is_set():
         color, depth, _fid = framebuf.get()
         if color is None:
-            time.sleep(0.05)
+            time.sleep(idle_s)
             continue
         zone_bgr = color[y1:y2, x1:x2]
         zone_depth = depth[y1:y2, x1:x2]
         if zone_bgr.size == 0:
-            time.sleep(0.05)
+            time.sleep(idle_s)
             continue
 
         cycle_start = time.time()
@@ -832,7 +1066,8 @@ def zone_pipeline(zone: str, lane: int, rect, framebuf: FrameBuffer, state: Shar
         now = time.time()
 
         # rising-edge occupancy + per-zone cooldown, Section 19.5.5
-        if occupied and not was_occupied and (now - last_publish) >= cooldown:
+        # Continuous occupancy + per-zone cooldown
+        if occupied and (now - last_publish) >= cooldown:
             state.set_active(zone, True)
             pear_id = state.next_pear_id(zone)
             if is_row_a:
@@ -884,7 +1119,7 @@ def zone_pipeline(zone: str, lane: int, rect, framebuf: FrameBuffer, state: Shar
             state.set_active(zone, False, action=status)
 
         was_occupied = occupied
-        time.sleep(0.02)
+        time.sleep(poll_s)
 
 
 # ==============================================================================
@@ -906,6 +1141,7 @@ class SpeedController:
         self.max_v = cfg["speed_publisher"]["max_voltage"]
         self.max_speed = cfg["max_ref_speed_ms"]
         self.max_pears = cfg["max_pears_in_vision_zone"]
+        self.trim_gain = cfg["speed_control"]["pid_trim_gain"]
         self.last_state = {"belt_state": "EMPTY", "conv1_v": self.max_v, "conv2_v": self.min_v,
                             "reference_speed_ms": 0.0, "pear_count": 0}
 
@@ -931,7 +1167,7 @@ class SpeedController:
         # sensor that doesn't exist; swap in real feedback here if/when a
         # conveyor encoder is added).
         conv1_v = target_conv1 + self.pid_conv1.step(
-            target_conv1, self.last_state["conv1_v"], dt) * 0.01
+            target_conv1, self.last_state["conv1_v"], dt) * self.trim_gain
         conv1_v = min(max(conv1_v, self.min_v), self.max_v)
         conv2_v = min(max(self.max_v - conv1_v, self.min_v), self.max_v)  # re-derive: enforce sum
         conv1_v = self.max_v - conv2_v
@@ -947,11 +1183,12 @@ class SpeedController:
         return self.last_state
 
 
-def speed_publisher_node(speed_ctrl: SpeedController, stop_event: threading.Event):
+def speed_publisher_node(speed_ctrl: SpeedController, stop_event: threading.Event, cfg: dict):
     """Section 10.3: all three loops must settle well inside the 1 s cycle;
-    this loop runs the PID/PWM update at 10 Hz (100 ms), matching the ~10 ms
-    budget line item of Table 20 for many updates per action cycle."""
-    dt = 0.1
+    this loop runs the PID/PWM update at 10 Hz (100 ms) by default, matching
+    the ~10 ms budget line item of Table 20 for many updates per action
+    cycle. Adjust CONFIG["speed_control"]["loop_dt_s"] to change the rate."""
+    dt = cfg["speed_control"]["loop_dt_s"]
     while not stop_event.is_set():
         speed_ctrl.step(dt)
         time.sleep(dt)
@@ -977,6 +1214,7 @@ class DataCollectionNode:
 
     def run(self, speed_ctrl: SpeedController, stop_event: threading.Event):
         iot_period = self.cfg["iot_publish_period_s"]
+        idle_s = self.cfg["timing"]["idle_sleep_s"]
         last_iot = 0.0
         while not stop_event.is_set():
             wrote_any = False
@@ -1000,7 +1238,7 @@ class DataCollectionNode:
                 last_iot = now
                 self._publish_iot(speed_ctrl)
             if not wrote_any:
-                time.sleep(0.05)
+                time.sleep(idle_s)
 
     def _write_pear(self, pear: PearData):
         self.conn.execute(
@@ -1058,12 +1296,9 @@ class DataCollectionNode:
 # SCADA DASHBOARD  -  Section 15: Flask web publisher on port 8080.
 # Dark IIoT theme, same visual language as the reference SCADA screenshots.
 # ==============================================================================
-COLORS = {"bg": "#0d1117", "surface": "#161b22", "border": "#30363d",
-          "green": "#00ff88", "amber": "#f59e0b", "red": "#ef4444", "blue": "#3b82f6"}
-
 STATUS_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="10">
+<meta http-equiv="refresh" content="{{ refresh_s }}">
 <title>SAAT SCADA - Status</title>
 <style>
   body{background:{{c.bg}};color:#e6edf3;font-family:'JetBrains Mono',monospace;margin:0;padding:24px;}
@@ -1122,9 +1357,10 @@ STATUS_PAGE = """
 </div>
 
 <div class="footer">
+  <a href="/camera">/camera (live view)</a> &nbsp;|&nbsp;
   <a href="/database">/database</a> &nbsp;|&nbsp; <a href="/labels">/labels</a> &nbsp;|&nbsp;
   <a href="/api/status">/api/status</a>
-  &nbsp;|&nbsp; auto-refresh every 10s &nbsp;|&nbsp; updated {{ now }}
+  &nbsp;|&nbsp; auto-refresh every {{ refresh_s }}s &nbsp;|&nbsp; updated {{ now }}
 </div>
 </body></html>
 """
@@ -1141,12 +1377,35 @@ DATABASE_PAGE = """
   .ACCEPTED{color:{{c.green}};} .REJECTED{color:{{c.red}};}
   a{color:{{c.blue}};}
 </style></head><body>
-<h1>&#128190; pear_records - 200 most recent</h1>
+<h1>&#128190; pear_records - {{ row_limit }} most recent</h1>
 <p><a href="/">&larr; back to status</a></p>
 <table><tr>{% for col in columns %}<th>{{col}}</th>{% endfor %}</tr>
 {% for row in rows %}<tr>{% for i in range(row|length) %}
 <td class="{{ row[3] if i==3 else '' }}">{{ row[i] }}</td>{% endfor %}</tr>{% endfor %}
 </table>
+</body></html>
+"""
+
+CAMERA_PAGE = """
+<!doctype html><html><head><meta charset="utf-8">
+<title>SAAT - Live Camera</title>
+<style>
+  body{background:{{c.bg}};color:#e6edf3;font-family:'JetBrains Mono',monospace;margin:0;padding:24px;}
+  h1{color:{{c.green}};font-size:20px;letter-spacing:1px;}
+  p{color:#8b949e;font-size:12px;}
+  a{color:{{c.blue}};text-decoration:none;}
+  .frame{max-width:100%;border:1px solid {{c.border}};border-radius:8px;margin-top:16px;background:#000;}
+  .legend{margin-top:14px;font-size:12px;color:#8b949e;display:flex;gap:20px;}
+  .swatch{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:middle;}
+</style></head><body>
+<h1>&#128247; SAAT - What The Camera Sees</h1>
+<p><a href="/">&larr; back to status</a> &nbsp;|&nbsp; live zone-annotated feed, ~{{ fps }} fps</p>
+<img class="frame" src="/video_feed">
+<div class="legend">
+  <div><span class="swatch" style="background:#8c8c8c;"></span>idle / no pear</div>
+  <div><span class="swatch" style="background:{{c.green}};"></span>accepted</div>
+  <div><span class="swatch" style="background:{{c.red}};"></span>rejected</div>
+</div>
 </body></html>
 """
 
@@ -1244,15 +1503,19 @@ LABEL_PAGE = """
 
 
 def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
-                     db_path: Path, camera_hardware_active: bool):
+                     db_path: Path, camera_hardware_active: bool, cfg: dict,
+                     stream_buf: "VideoStreamBuffer"):
     app = Flask(__name__)
+    dash = cfg["dashboard"]
+    colors = dash["colors"]
 
     @app.route("/")
     def status():
         raw = dc_node.get_iot_status()
         payload = json.loads(raw) if raw and raw != "{}" else {}
         return render_template_string(
-            STATUS_PAGE, c=COLORS, belt=payload.get("belt", {}) or {},
+            STATUS_PAGE, c=colors, refresh_s=dash["auto_refresh_s"],
+            belt=payload.get("belt", {}) or {},
             motors_status=payload.get("motors_status", []),
             batch_accepted=payload.get("batch_accepted", 0),
             batch_rejected=payload.get("batch_rejections", 0),
@@ -1270,16 +1533,35 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
     @app.route("/database")
     def database():
         conn = sqlite3.connect(str(db_path))
-        cur = conn.execute("SELECT * FROM pear_records ORDER BY timestamp DESC LIMIT 200")
+        cur = conn.execute("SELECT * FROM pear_records ORDER BY timestamp DESC LIMIT ?",
+                            (dash["database_rows_shown"],))
         columns = [d[0] for d in cur.description]
         rows = cur.fetchall()
         conn.close()
-        return render_template_string(DATABASE_PAGE, c=COLORS, columns=columns, rows=rows)
+        return render_template_string(DATABASE_PAGE, c=colors, columns=columns, rows=rows,
+                                       row_limit=dash["database_rows_shown"])
 
     @app.route("/api/status")
     def api_status():
         raw = dc_node.get_iot_status()
         return jsonify(json.loads(raw) if raw else {})
+
+    @app.route("/camera")
+    def camera_view():
+        return render_template_string(CAMERA_PAGE, c=colors, fps=cfg["camera_stream"]["target_fps"])
+
+    @app.route("/video_feed")
+    def video_feed():
+        def generate():
+            idle_wait = 1.0 / max(cfg["camera_stream"]["target_fps"], 1)
+            while True:
+                frame = stream_buf.get_frame()
+                if frame is None:
+                    time.sleep(idle_wait)
+                    continue
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                time.sleep(idle_wait)
+        return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     @app.route("/labels")
     def labels_index():
@@ -1293,7 +1575,7 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
                      "completed_at": datetime.fromtimestamp(r[1]).strftime("%Y-%m-%d %H:%M:%S"),
                      "duration": f"{r[2]:.1f}s", "upper_weight_g": r[3],
                      "lower_weight_g": r[4], "total_weight_g": r[5]} for r in rows]
-        return render_template_string(LABELS_INDEX_PAGE, c=COLORS, packages=packages)
+        return render_template_string(LABELS_INDEX_PAGE, c=colors, packages=packages)
 
     @app.route("/labels/<package_id>")
     def label_detail(package_id):
@@ -1335,12 +1617,15 @@ def classical_vision_initialization(init_event: threading.Event, cfg: dict):
 
 
 def main():
+    rd = RUNTIME_DEFAULTS   # edit RUNTIME_DEFAULTS at the top of the file to change these
     ap = argparse.ArgumentParser(description="SAAT - unified vision + control production system")
-    ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--no-web", action="store_true", help="headless: skip the Flask dashboard")
-    ap.add_argument("--duration", type=float, default=0.0, help="auto-stop after N seconds")
-    ap.add_argument("--db-path", type=str, default="./saat_data/saat_records.db")
-    ap.add_argument("--force-sim", action="store_true",
+    ap.add_argument("--port", type=int, default=rd["port"])
+    ap.add_argument("--no-web", action="store_true", default=rd["no_web"],
+                     help="headless: skip the Flask dashboard")
+    ap.add_argument("--duration", type=float, default=rd["duration"],
+                     help="auto-stop after N seconds (0 = run until Ctrl+C)")
+    ap.add_argument("--db-path", type=str, default=rd["db_path"])
+    ap.add_argument("--force-sim", action="store_true", default=rd["force_sim"],
                      help="ignore any hardware libraries even if present (dev/demo mode)")
     args = ap.parse_args()
 
@@ -1376,7 +1661,7 @@ def main():
 
     # T+1: camera + frame_capture_node
     print("[SAAT] T+1: starting camera / frame_capture_node...")
-    camera = CameraSystem(CONFIG["camera"])
+    camera = CameraSystem(CONFIG)
     framebuf = FrameBuffer()
     t = threading.Thread(target=frame_capture_node, args=(camera, framebuf, stop_event, CONFIG),
                           daemon=True)
@@ -1409,7 +1694,7 @@ def main():
 
     # T+4: speed_publisher_node (dual PID -> PWM -> LPF -> PLC)
     print("[SAAT] T+4: starting speed_publisher_node...")
-    t = threading.Thread(target=speed_publisher_node, args=(speed_ctrl, stop_event), daemon=True)
+    t = threading.Thread(target=speed_publisher_node, args=(speed_ctrl, stop_event, CONFIG), daemon=True)
     t.start(); threads.append(t)
 
     # T+5: data_collection_node (sequential DB writer + packaging + IoT publish)
@@ -1417,15 +1702,25 @@ def main():
     t = threading.Thread(target=dc_node.run, args=(speed_ctrl, stop_event), daemon=True)
     t.start(); threads.append(t)
 
+    # T+5.5: live camera view ("what the camera sees, and what it does")
+    stream_buf = VideoStreamBuffer()
+    if CONFIG["camera_stream"]["enabled"]:
+        print("[SAAT] T+5.5: starting video_stream_node (live /camera view)...")
+        t = threading.Thread(target=video_stream_node,
+                              args=(framebuf, state, rects, stream_buf, stop_event, CONFIG),
+                              daemon=True)
+        t.start(); threads.append(t)
+
     # T+6: SCADA dashboard
     if not args.no_web:
-        app = build_flask_app(dc_node, speed_ctrl, db_path, camera.hardware_active)
+        app = build_flask_app(dc_node, speed_ctrl, db_path, camera.hardware_active, CONFIG, stream_buf)
         t = threading.Thread(
             target=lambda: app.run(host="0.0.0.0", port=args.port, debug=False,
                                     use_reloader=False, threaded=True), daemon=True)
         t.start(); threads.append(t)
         time.sleep(0.5)
         print(f"[SAAT] Dashboard : http://localhost:{args.port}")
+        print(f"[SAAT] Live Camera: http://localhost:{args.port}/camera")
         print(f"[SAAT] Database  : http://localhost:{args.port}/database")
         print(f"[SAAT] Labels    : http://localhost:{args.port}/labels")
         print(f"[SAAT] JSON API  : http://localhost:{args.port}/api/status")
@@ -1445,6 +1740,8 @@ def main():
     finally:
         stop_event.set()
         conv1.stop(); conv2.stop()
+        if HAVE_GPIO:
+            GPIO.cleanup()
         camera.stop()
         conn.close()
         print("[SAAT] Stopped. Database saved at:", db_path.resolve())
