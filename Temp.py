@@ -58,7 +58,7 @@ NON-NEGOTIABLE SYSTEM CONSTRAINTS (Section 18) enforced throughout this file:
 
 HOW TO RUN
 ----------
-    pip install opencv-python numpy flask
+    pip install opencv-python numpy flask openpyxl
     # optional, only needed for the real hardware paths (auto-detected):
     pip install pyrealsense2 Jetson.GPIO adafruit-circuitpython-servokit
 
@@ -71,11 +71,20 @@ HOW TO RUN
     Database  : http://localhost:8080/database
     Labels    : http://localhost:8080/labels
     JSON API  : http://localhost:8080/api/status
+
+LOGO
+----
+    Put your real logo file at:  static/logo.png  (next to this script)
+    It is served as-is at /assets/logo.png. If the file is missing, the
+    server prints a warning and returns a 404 for that image instead of
+    silently showing a blank placeholder.
 ================================================================================
 """
 
 import argparse
+import csv
 import heapq
+import io
 import itertools
 import json
 import queue
@@ -115,10 +124,18 @@ except ImportError:
     HAVE_SERVOKIT = False
 
 try:
-    from flask import Flask, jsonify, render_template_string, Response
+    from flask import Flask, jsonify, render_template_string, Response, send_from_directory
     HAVE_FLASK = True
 except ImportError:
     HAVE_FLASK = False
+
+# openpyxl is only needed for the /download/database/*.xlsx export buttons.
+# Optional, same graceful-degradation pattern as everything else in this file.
+try:
+    from openpyxl import Workbook
+    HAVE_OPENPYXL = True
+except ImportError:
+    HAVE_OPENPYXL = False
 
 
 ########################################################################################
@@ -263,12 +280,12 @@ CONFIG = {
     # 9) SERVO ACTUATION  -  Section 12 / Table 19
     # ==========================================================================
     "servo": {
-        "angle_rejected": 0.0, 
-        "angle_home": 80.0, 
+        "angle_rejected": 0.0,
+        "angle_home": 80.0,
         "angle_accepted": 175.0,
         "return_delay_s": 0.4,
-        "pulse_min_us": 500,           
-        "pulse_max_us": 2500,          
+        "pulse_min_us": 500,
+        "pulse_max_us": 2500,
         "pwm_freq_hz": 50,
         "occupancy_cooldown_s": 3.0,
         "max_concurrent_moves": 1,   # <-- CALIBRATE: 1 = strictly one servo moves at a time, 2 = allow two in parallel
@@ -324,6 +341,15 @@ CONFIG = {
                    "green": "#00ff88", "amber": "#f59e0b", "red": "#ef4444", "blue": "#3b82f6"},
         "auto_refresh_s": 10,            # status-page <meta refresh>, matches iot_publish_period_s
         "database_rows_shown": 200,
+    },
+
+    # ==========================================================================
+    # 15) BRANDING / STATIC ASSETS  -  where the real logo file lives on disk.
+    #     Put your actual SAAT logo PNG at this path; it is served as-is at
+    #     /assets/logo.png (no base64 embedding, no placeholder pixel).
+    # ==========================================================================
+    "branding": {
+        "logo_path": "static/logo.png",   # <-- put your real logo file here
     },
 }
 
@@ -573,13 +599,13 @@ def _ensure_gpio_mode():
     with _gpio_mode_lock:
         if not _gpio_mode_ready:
             GPIO.setwarnings(False)
-            
+
             # --- FIX: Clear Adafruit Blinka's conflicting mode lock ---
             current_mode = GPIO.getmode()
             if current_mode is not None and current_mode != GPIO.BOARD:
                 GPIO.cleanup()
             # ----------------------------------------------------------
-            
+
             GPIO.setmode(GPIO.BOARD)
             _gpio_mode_ready = True
 
@@ -1499,14 +1525,6 @@ class DataCollectionNode:
 # Dark IIoT theme, same visual language as the reference SCADA screenshots.
 # ==============================================================================
 
-# SAAT logo, embedded as base64 so the dashboard is one self-contained file
-# with no extra static-asset folder to deploy alongside it. Served at
-# /assets/logo.png by build_flask_app() and referenced by every page below.
-LOGO_BASE64 = (
-    # NOTE: placeholder 1x1 PNG - swap in your real logo's base64 string here.
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR42mNgAAACAAFV5z3nAAAAAElFTkSuQmCC"
-)
-
 # ------------------------------------------------------------------------------
 # Shared top navigation bar (logo + page links as real buttons, Section: item 1)
 # used by every dashboard page so navigation is consistent everywhere.
@@ -1897,6 +1915,7 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
     app = Flask(__name__)
     dash = cfg["dashboard"]
     colors = dash["colors"]
+    logo_path = Path(cfg["branding"]["logo_path"]).resolve()
 
     @app.route("/")
     def status():
@@ -1960,10 +1979,18 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
                 time.sleep(idle_wait)
         return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
+    # --------------------------------------------------------------------
+    # FIX #1: serve the real logo file from disk instead of a hardcoded
+    # base64 placeholder pixel. Put your actual PNG at CONFIG["branding"]
+    # ["logo_path"] (default: static/logo.png, next to this script).
+    # --------------------------------------------------------------------
     @app.route("/assets/logo.png")
     def logo():
-        import base64 as _b64
-        return Response(_b64.b64decode(LOGO_BASE64), mimetype="image/png")
+        if not logo_path.exists():
+            print(f"[SAAT] WARNING: logo file not found at {logo_path} - "
+                  f"put your real logo there (see CONFIG['branding']['logo_path']).")
+            return Response(status=404)
+        return send_from_directory(logo_path.parent, logo_path.name, mimetype="image/png")
 
     @app.route("/labels")
     def labels_index():
@@ -2002,6 +2029,95 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
             all_pears=all_pears,
             packaging_time=datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S"),
             packaging_clock=f"{mins:02d}:{secs:02d}")
+
+    # --------------------------------------------------------------------
+    # FIX #2: the download/export routes that LABELS_INDEX_PAGE,
+    # LABEL_PAGE, and DATABASE_PAGE link to, but which never existed
+    # before -> every click on those buttons was a 404.
+    # --------------------------------------------------------------------
+    @app.route("/download/labels/all.csv")
+    def download_all_labels():
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute(
+            "SELECT package_id, end_timestamp, upper_layer, lower_layer, total_weight_g "
+            "FROM packages ORDER BY end_timestamp DESC")
+        rows = cur.fetchall()
+        conn.close()
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["package_id", "pear_id", "category", "position", "mass_g", "completed_at"])
+        for package_id, end_ts, upper_json, lower_json, _total_w in rows:
+            completed_at = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S")
+            for item in json.loads(upper_json):
+                w.writerow([package_id, item["pear_id"], "BIG", item["position"],
+                            item["mass_g"], completed_at])
+            for item in json.loads(lower_json):
+                w.writerow([package_id, item["pear_id"], "SMALL", item["position"],
+                            item["mass_g"], completed_at])
+        return Response(out.getvalue(), mimetype="text/csv",
+                         headers={"Content-Disposition": "attachment; filename=all_labels.csv"})
+
+    @app.route("/download/labels/<package_id>.csv")
+    def download_one_label(package_id):
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute(
+            "SELECT upper_layer, lower_layer FROM packages WHERE package_id = ?", (package_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row is None:
+            return f"Package {package_id} not found", 404
+        upper_json, lower_json = row
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["package_id", "pear_id", "category", "position", "mass_g"])
+        for item in json.loads(upper_json):
+            w.writerow([package_id, item["pear_id"], "BIG", item["position"], item["mass_g"]])
+        for item in json.loads(lower_json):
+            w.writerow([package_id, item["pear_id"], "SMALL", item["position"], item["mass_g"]])
+        return Response(out.getvalue(), mimetype="text/csv",
+                         headers={"Content-Disposition": f"attachment; filename={package_id}.csv"})
+
+    def _export_database_xlsx(rows, columns, filename):
+        if not HAVE_OPENPYXL:
+            return Response(
+                "openpyxl is not installed on the server. Run:\n"
+                "    pip install openpyxl\nand try again.",
+                mimetype="text/plain", status=501)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "pear_records"
+        ws.append(columns)
+        for row in rows:
+            ws.append(list(row))
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return Response(
+            buf.read(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+    @app.route("/download/database/all.xlsx")
+    def download_database_all():
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute("SELECT * FROM pear_records ORDER BY timestamp DESC")
+        columns = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        conn.close()
+        return _export_database_xlsx(rows, columns, "pear_records_all.xlsx")
+
+    @app.route("/download/database/today.xlsx")
+    def download_database_today():
+        start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute(
+            "SELECT * FROM pear_records WHERE timestamp >= ? ORDER BY timestamp DESC",
+            (start_of_day,))
+        columns = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        conn.close()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        return _export_database_xlsx(rows, columns, f"pear_records_{today_str}.xlsx")
 
     return app
 
@@ -2045,6 +2161,14 @@ def main():
     print(" SAAT PRODUCTION SYSTEM - Pear Sorting & Packaging Line")
     print(" Vision Subsystem + Control Subsystem, unified single-process launch")
     print("=" * 78)
+
+    # Early heads-up if the real logo file hasn't been dropped in yet, so
+    # this is obvious from the console instead of a silent blank image.
+    logo_path = Path(CONFIG["branding"]["logo_path"])
+    if not logo_path.exists():
+        print(f"[SAAT] NOTE: no logo found at '{logo_path}'. The nav bar / "
+              f"labels will show a broken image until you add your real "
+              f"logo PNG there (or update CONFIG['branding']['logo_path']).")
 
     state = SharedState()
     stop_event = threading.Event()
