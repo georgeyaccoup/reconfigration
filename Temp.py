@@ -211,7 +211,7 @@ CONFIG = {
         # check. Add more (hue_lo, hue_hi) tuples to cover other pear
         # varieties/ripeness stages - e.g. red pears wrap around hue 0, so
         # add two ranges: (0, 10) and (170, 179).
-        "pear_hue_ranges": [(15, 45)],                 # yellow-green pear hue band  <-- CALIBRATE to your pear/lighting
+        "pear_hue_ranges": [(20, 50)],                 # yellow-green pear hue band  <-- CALIBRATE to your pear/lighting
         "pear_sat_min": 45,                             # filters out grey/black plastic, metal, shadows  <-- CALIBRATE
         "pear_val_min": 40,                             # filters out near-black frame/shadow pixels       <-- CALIBRATE
         "min_color_match_ratio": 0.5,                   # >= this fraction of the silhouette must be "pear-coloured"  <-- CALIBRATE
@@ -288,7 +288,16 @@ CONFIG = {
         "pulse_max_us": 2500,
         "pwm_freq_hz": 50,
         "occupancy_cooldown_s": 3.0,
-        "max_concurrent_moves": 1,   # <-- CALIBRATE: 1 = strictly one servo moves at a time, 2 = allow two in parallel
+        "max_concurrent_moves": 1,   # <-- CALIBRATE: priority-queue concurrency level.
+                                      #   1      = strictly one servo moves at a time
+                                      #   2      = allow two in parallel
+                                      #   "free" = no cap - every currently-waiting zone
+                                      #            can move at once (up to all 6 lanes).
+                                      #            B-row-before-A-row priority order (see
+                                      #            ZONE_PRIORITY) still governs which jobs
+                                      #            are *pulled off the queue first*, it's
+                                      #            just that nothing blocks waiting for a
+                                      #            free "slot" anymore.
 
     },
 
@@ -690,6 +699,26 @@ class ServoController:
 
     A move already in progress is never interrupted, but the next move to
     START is always the highest-priority one currently waiting.
+
+    CONCURRENCY LEVELS (CONFIG["servo"]["max_concurrent_moves"]) - three
+    supported levels, from most restrictive to least:
+
+        1        ONE SERVO   - only one physical arm ever moves at a time.
+                                Every other pending zone waits its turn in
+                                strict B1>B2>B3>A1>A2>A3 order.
+        2        TWO SERVOS  - up to two arms move in parallel; a 3rd+
+                                pending zone still queues and waits for a
+                                slot to free up, highest priority first.
+        "free"   FREE        - no concurrency cap at all. Every zone that is
+                                currently waiting is dispatched immediately
+                                (bounded only by the physical reality of 6
+                                lanes existing). The priority order still
+                                decides which jobs are popped off the heap
+                                first - it just stops mattering much in
+                                practice once nothing has to wait for a slot.
+
+    In every level the pop-order out of the heap is identical: it is only
+    `_max_concurrent` (how many popped jobs may run at once) that changes.
     """
 
     def __init__(self, cfg):
@@ -711,7 +740,18 @@ class ServoController:
             print("[ServoController] adafruit_servokit not available - offline mode.")
 
         # --- priority scheduler state ---
-        self._max_concurrent = max(1, int(cfg.get("max_concurrent_moves", 1)))
+        # Three supported concurrency levels: 1 (one servo), 2 (two servos),
+        # or "free" (no cap - effectively bounded only by the fact that
+        # there are only 6 physical lanes, so 6 is as "unlimited" as it
+        # can ever get). Priority pop-order (B1>B2>B3>A1>A2>A3) is unchanged
+        # by this setting in all three cases.
+        raw_level = cfg.get("max_concurrent_moves", 1)
+        if isinstance(raw_level, str) and raw_level.strip().lower() in ("free", "unlimited", "all", "none"):
+            self._max_concurrent = len(MOTOR_CHANNEL)   # 6 - every lane at once
+            self._mode_label = "FREE (unlimited - all lanes may move at once)"
+        else:
+            self._max_concurrent = max(1, int(raw_level))
+            self._mode_label = f"{self._max_concurrent} concurrent"
         self._move_slots = threading.Semaphore(self._max_concurrent)
         self._queue_cv = threading.Condition()
         self._heap = []                        # [(priority, seq, zone, accepted), ...]
@@ -721,7 +761,7 @@ class ServoController:
         self._dispatcher = threading.Thread(target=self._dispatcher_loop, daemon=True)
         self._dispatcher.start()
         print(f"[ServoController] priority scheduler online - "
-              f"max_concurrent_moves={self._max_concurrent}, "
+              f"mode={self._mode_label}, "
               f"order=B1>B2>B3>A1>A2>A3")
 
     # ---- public API (called from zone_pipeline) ---------------------------
