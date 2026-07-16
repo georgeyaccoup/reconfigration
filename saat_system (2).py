@@ -58,7 +58,7 @@ NON-NEGOTIABLE SYSTEM CONSTRAINTS (Section 18) enforced throughout this file:
 
 HOW TO RUN
 ----------
-    pip install opencv-python numpy flask
+    pip install opencv-python numpy flask openpyxl
     # optional, only needed for the real hardware paths (auto-detected):
     pip install pyrealsense2 Jetson.GPIO adafruit-circuitpython-servokit
 
@@ -71,10 +71,21 @@ HOW TO RUN
     Database  : http://localhost:8080/database
     Labels    : http://localhost:8080/labels
     JSON API  : http://localhost:8080/api/status
+
+LOGO
+----
+    Put your real logo file at:  static/logo.png  (next to this script)
+    It is served as-is at /assets/logo.png. If the file is missing, the
+    server prints a warning and returns a 404 for that image instead of
+    silently showing a blank placeholder.
 ================================================================================
 """
 
 import argparse
+import csv
+import heapq
+import io
+import itertools
 import json
 import queue
 import random
@@ -85,7 +96,8 @@ from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-
+import re
+import subprocess
 import numpy as np
 import cv2
 
@@ -113,10 +125,18 @@ except ImportError:
     HAVE_SERVOKIT = False
 
 try:
-    from flask import Flask, jsonify, render_template_string
+    from flask import Flask, jsonify, render_template_string, Response, send_from_directory
     HAVE_FLASK = True
 except ImportError:
     HAVE_FLASK = False
+
+# openpyxl is only needed for the /download/database/*.xlsx export buttons.
+# Optional, same graceful-degradation pattern as everything else in this file.
+try:
+    from openpyxl import Workbook
+    HAVE_OPENPYXL = True
+except ImportError:
+    HAVE_OPENPYXL = False
 
 
 ########################################################################################
@@ -136,6 +156,11 @@ except ImportError:
 
 ZONE_ORDER = ["A1", "A2", "A3", "B1", "B2", "B3"]          # Sections 4.2 / 14.1
 MOTOR_CHANNEL = {"A1": 0, "A2": 1, "A3": 2, "B1": 3, "B2": 4, "B3": 5}  # PCA9685 channels, servos_testing.py
+
+# Servo move priority (Section 18 update): B row always drains before A row;
+# within a row, lower lane number always goes before higher. Lower number =
+# higher priority (popped first by ServoController's scheduler).
+ZONE_PRIORITY = {"B1": 0, "B2": 1, "B3": 2, "A1": 3, "A2": 4, "A3": 5}
 
 CONFIG = {
 
@@ -179,6 +204,18 @@ CONFIG = {
         "clahe_clip": 2.0, "clahe_tile": (8, 8),       # CLAHE contrast enhancement (step 3 of 9)
         "bilateral_d": 9, "bilateral_sigma": 75,       # bilateral filter smoothing (step 4 of 9)
         "morph_kernel_size": 5,                        # morphological open/close kernel, px (step 6 of 9)
+
+        # ---- "is this even a pear, colour-wise?" gate -----------------------
+        # Anything sitting in a zone that does NOT match one of these HSV
+        # bands (hands, tools, cables, packaging, belt debris, etc.) is
+        # rejected outright, independent of the shape gate and infection
+        # check. Add more (hue_lo, hue_hi) tuples to cover other pear
+        # varieties/ripeness stages - e.g. red pears wrap around hue 0, so
+        # add two ranges: (0, 10) and (170, 179).
+        "pear_hue_ranges": [(20, 50)],                 # yellow-green pear hue band  <-- CALIBRATE to your pear/lighting
+        "pear_sat_min": 45,                             # filters out grey/black plastic, metal, shadows  <-- CALIBRATE
+        "pear_val_min": 40,                             # filters out near-black frame/shadow pixels       <-- CALIBRATE
+        "min_color_match_ratio": 0.5,                   # >= this fraction of the silhouette must be "pear-coloured"  <-- CALIBRATE
     },
     "big_small_threshold_px2": 15000,               # Section 8.6: BIG/SMALL category cutoff
 
@@ -193,6 +230,20 @@ CONFIG = {
         "solidity_min": 0.85,
         "circularity": (0.4, 0.9),
         "min_checks_passed": 3,   # out of 4 checks must pass to call it "a pear"
+    },
+
+    # ==========================================================================
+    # 5b) EMPTY-BELT BACKGROUND MODEL  -  Section 19: "be ready for empty all
+    #     the time". Learns what the empty gantry/slot (3D-printed frame +
+    #     fabric flaps, no pear) looks like per zone, so that texture is
+    #     never mistaken for a pear, and keeps slowly adapting so lighting
+    #     drift doesn't cause false detections hours into a shift.
+    # ==========================================================================
+    "background_model": {
+        "learn_frames": 25,          # frames averaged at startup to build the initial empty-belt reference
+        "update_alpha": 0.02,        # how fast the background keeps adapting during confirmed-empty periods
+        "diff_threshold": 30,        # <-- CALIBRATE: pixel intensity difference (0-255) that counts as "something changed"
+        "min_foreground_px": 600,    # ignore foreground blobs smaller than this (dust, shadows, vibration) <-- CALIBRATE
     },
 
     # ==========================================================================
@@ -230,20 +281,46 @@ CONFIG = {
     # 9) SERVO ACTUATION  -  Section 12 / Table 19
     # ==========================================================================
     "servo": {
-        "accept_angle": 0.0, "reject_angle": 90.0,     # <-- CALIBRATE if your gate geometry differs
+        "angle_rejected": 0.0,
+        "angle_home": 92.0,
+        "angle_accepted": 175.0,
         "return_delay_s": 0.4,
-        "pulse_min_us": 1000, "pulse_max_us": 2000,     # <-- CALIBRATE per servo datasheet
+        "pulse_min_us": 500,
+        "pulse_max_us": 2500,
         "pwm_freq_hz": 50,
-        "occupancy_cooldown_s": 3.0,   # Section 19.5.5 debounce: min seconds between triggers per zone  <-- TUNE
+        "occupancy_cooldown_s": 3.0,
+        "max_concurrent_moves": 1,   # <-- CALIBRATE: priority-queue concurrency level.
+                                      #   1      = strictly one servo moves at a time
+                                      #   2      = allow two in parallel
+                                      #   "free" = no cap - every currently-waiting zone
+                                      #            can move at once (up to all 6 lanes).
+                                      #            B-row-before-A-row priority order (see
+                                      #            ZONE_PRIORITY) still governs which jobs
+                                      #            are *pulled off the queue first*, it's
+                                      #            just that nothing blocks waiting for a
+                                      #            free "slot" anymore.
+
     },
 
     # ==========================================================================
-    # 10) PACKAGING  -  Section 15.3 / Figure 15.2
+    # 10) LIVE CAMERA VIEW  -  "what the camera sees / what it does": streams
+    #     the annotated colour feed to the dashboard at /camera (/video_feed)
+    # ==========================================================================
+    "camera_stream": {
+        "enabled": True,
+        "target_fps": 10,             # how often a new overlay frame is composited/streamed
+        "jpeg_quality": 75,           # 0-100, higher = sharper but more bandwidth
+        "show_zone_grid": True,
+        "show_status_banner": True,
+    },
+
+    # ==========================================================================
+    # 11) PACKAGING  -  Section 15.3 / Figure 15.2
     # ==========================================================================
     "packaging": {"big_per_package": 12, "small_per_package": 12, "company_name": "SAAT"},
 
     # ==========================================================================
-    # 11) TIMING / POLLING  -  Section 13 loop cadences and the 1 s cycle budget
+    # 12) TIMING / POLLING  -  Section 13 loop cadences and the 1 s cycle budget
     # ==========================================================================
     "iot_publish_period_s": 10.0,        # Section 14.3: 0.1 Hz cloud/dashboard publish
     "action_cycle_budget_s": 1.0,        # Section 13: hard 1-second action-cycle deadline
@@ -253,7 +330,7 @@ CONFIG = {
     },
 
     # ==========================================================================
-    # 12) DEV / OFFLINE SIMULATION MODE  -  only used when no RealSense camera
+    # 13) DEV / OFFLINE SIMULATION MODE  -  only used when no RealSense camera
     #     is detected (or --force-sim is passed); controls the synthetic pears
     #     used to exercise the pipeline without physical hardware attached.
     # ==========================================================================
@@ -267,13 +344,22 @@ CONFIG = {
     },
 
     # ==========================================================================
-    # 13) DASHBOARD  -  Section 15 SCADA web publisher (Flask, port 8080)
+    # 14) DASHBOARD  -  Section 15 SCADA web publisher (Flask, port 8080)
     # ==========================================================================
     "dashboard": {
         "colors": {"bg": "#0d1117", "surface": "#161b22", "border": "#30363d",
                    "green": "#00ff88", "amber": "#f59e0b", "red": "#ef4444", "blue": "#3b82f6"},
         "auto_refresh_s": 10,            # status-page <meta refresh>, matches iot_publish_period_s
         "database_rows_shown": 200,
+    },
+
+    # ==========================================================================
+    # 15) BRANDING / STATIC ASSETS  -  where the real logo file lives on disk.
+    #     Put your actual SAAT logo PNG at this path; it is served as-is at
+    #     /assets/logo.png (no base64 embedding, no placeholder pixel).
+    # ==========================================================================
+    "branding": {
+        "logo_path": "static/logo.png",   # <-- put your real logo file here
     },
 }
 
@@ -478,7 +564,58 @@ def init_db(db_path: Path):
     conn.commit()
     return conn
 
+class CloudflareTunnel:
+    """Launches `cloudflared tunnel --url http://localhost:<port>` and captures
+    the public *.trycloudflare.com URL cloudflared prints once the tunnel is
+    live, so the dashboard can show/link it automatically."""
 
+    URL_RE = re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
+
+    def __init__(self, local_port: int, cloudflared_path: str = "cloudflared"):
+        self.local_port = local_port
+        self.cloudflared_path = cloudflared_path
+        self._lock = threading.Lock()
+        self._public_url = None
+        self._process = None
+        self._stop = False
+
+    @property
+    def public_url(self):
+        with self._lock:
+            return self._public_url
+
+    def start(self):
+        try:
+            self._process = subprocess.Popen(
+                [self.cloudflared_path, "tunnel", "--url", f"http://localhost:{self.local_port}"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            print("[CloudflareTunnel] 'cloudflared' not found on PATH - install it: "
+                  "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
+            return
+        threading.Thread(target=self._read_output, daemon=True).start()
+        print(f"[CloudflareTunnel] starting quick tunnel -> http://localhost:{self.local_port} ...")
+
+    def _read_output(self):
+        for line in self._process.stdout:
+            if self._stop:
+                break
+            m = self.URL_RE.search(line)
+            if m:
+                with self._lock:
+                    self._public_url = m.group(0)
+                print(f"[CloudflareTunnel] public URL ready: {self._public_url}")
+
+    def stop(self):
+        self._stop = True
+        if self._process:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
 # ==============================================================================
 # PID  -  textbook discrete controller, gains from Table 15
 # ==============================================================================
@@ -513,7 +650,6 @@ class PID:
 _gpio_mode_lock = threading.Lock()
 _gpio_mode_ready = False
 
-
 def _ensure_gpio_mode():
     """Jetson.GPIO.setmode()/setwarnings() are process-global and may only be
     called ONCE - calling it again (even with the same mode) from a second
@@ -524,6 +660,13 @@ def _ensure_gpio_mode():
     with _gpio_mode_lock:
         if not _gpio_mode_ready:
             GPIO.setwarnings(False)
+
+            # --- FIX: Clear Adafruit Blinka's conflicting mode lock ---
+            current_mode = GPIO.getmode()
+            if current_mode is not None and current_mode != GPIO.BOARD:
+                GPIO.cleanup()
+            # ----------------------------------------------------------
+
             GPIO.setmode(GPIO.BOARD)
             _gpio_mode_ready = True
 
@@ -587,7 +730,49 @@ class VoltageChannel:
 # SERVO CONTROLLER  -  generalisation of servo_gui.py / servos_testing.py.
 # Six MG995 servos (A1..B3) on one PCA9685, channels 0-5 (Section 12/Table 19).
 # ==============================================================================
+
 class ServoController:
+    """
+    Six MG995 servos (A1..B3) on one PCA9685 (Section 12/Table 19), driven
+    through a single global PRIORITY SCHEDULER instead of firing every
+    servo the instant a pear is detected.
+
+    WHY: letting every zone move its servo immediately means, when several
+    lanes detect pears close together, up to 6 servos can try to move at
+    once - that causes power sag / timing jitter and a visible delay in
+    each individual move. Limiting how many can move concurrently
+    (CONFIG["servo"]["max_concurrent_moves"]) keeps each move fast and clean.
+
+    HOW: dispatch() no longer spins up its own thread - it pushes a job
+    onto a priority queue. A pool of worker "slots" pulls jobs off that
+    queue in this fixed priority order (Section 18 update):
+
+        B1 > B2 > B3 > A1 > A2 > A3
+
+    A move already in progress is never interrupted, but the next move to
+    START is always the highest-priority one currently waiting.
+
+    CONCURRENCY LEVELS (CONFIG["servo"]["max_concurrent_moves"]) - three
+    supported levels, from most restrictive to least:
+
+        1        ONE SERVO   - only one physical arm ever moves at a time.
+                                Every other pending zone waits its turn in
+                                strict B1>B2>B3>A1>A2>A3 order.
+        2        TWO SERVOS  - up to two arms move in parallel; a 3rd+
+                                pending zone still queues and waits for a
+                                slot to free up, highest priority first.
+        "free"   FREE        - no concurrency cap at all. Every zone that is
+                                currently waiting is dispatched immediately
+                                (bounded only by the physical reality of 6
+                                lanes existing). The priority order still
+                                decides which jobs are popped off the heap
+                                first - it just stops mattering much in
+                                practice once nothing has to wait for a slot.
+
+    In every level the pop-order out of the heap is identical: it is only
+    `_max_concurrent` (how many popped jobs may run at once) that changes.
+    """
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.hardware_active = HAVE_SERVOKIT
@@ -597,13 +782,91 @@ class ServoController:
                 self.kit = ServoKit(channels=16)
                 for ch in MOTOR_CHANNEL.values():
                     self.kit.servo[ch].set_pulse_width_range(cfg["pulse_min_us"], cfg["pulse_max_us"])
-                print("[ServoController] PCA9685 initialised, pulse widths calibrated.")
+                    # Initialize aggressively to the HOME position
+                    self.kit.servo[ch].angle = cfg["angle_home"]
+                print("[ServoController] PCA9685 initialised, all servos snapped to HOME (80 deg).")
             except Exception as e:
                 print(f"[ServoController] Hardware error: {e}. Falling back to offline mode.")
                 self.hardware_active = False
         else:
-            print("[ServoController] adafruit_servokit not available - offline mode "
-                  "(servo moves will be logged, not executed).")
+            print("[ServoController] adafruit_servokit not available - offline mode.")
+
+        # --- priority scheduler state ---
+        # Three supported concurrency levels: 1 (one servo), 2 (two servos),
+        # or "free" (no cap - effectively bounded only by the fact that
+        # there are only 6 physical lanes, so 6 is as "unlimited" as it
+        # can ever get). Priority pop-order (B1>B2>B3>A1>A2>A3) is unchanged
+        # by this setting in all three cases.
+        raw_level = cfg.get("max_concurrent_moves", 1)
+        if isinstance(raw_level, str) and raw_level.strip().lower() in ("free", "unlimited", "all", "none"):
+            self._max_concurrent = len(MOTOR_CHANNEL)   # 6 - every lane at once
+            self._mode_label = "FREE (unlimited - all lanes may move at once)"
+        else:
+            self._max_concurrent = max(1, int(raw_level))
+            self._mode_label = f"{self._max_concurrent} concurrent"
+        self._move_slots = threading.Semaphore(self._max_concurrent)
+        self._queue_cv = threading.Condition()
+        self._heap = []                        # [(priority, seq, zone, accepted), ...]
+        self._seq = itertools.count()           # FIFO tie-breaker within same priority
+        self._pending_zones = set()             # one outstanding job per zone (de-dupe)
+        self._stop = False
+        self._dispatcher = threading.Thread(target=self._dispatcher_loop, daemon=True)
+        self._dispatcher.start()
+        print(f"[ServoController] priority scheduler online - "
+              f"mode={self._mode_label}, "
+              f"order=B1>B2>B3>A1>A2>A3")
+
+    # ---- public API (called from zone_pipeline) ---------------------------
+    def dispatch(self, zone: str, accepted: bool):
+        """Queue a move for `zone`. Non-blocking - returns immediately."""
+        priority = ZONE_PRIORITY.get(zone)
+        if priority is None:
+            return
+        with self._queue_cv:
+            if zone in self._pending_zones:
+                # A zone only has one physical arm - if it's already queued
+                # or moving, don't pile up a second request for it.
+                return
+            self._pending_zones.add(zone)
+            heapq.heappush(self._heap, (priority, next(self._seq), zone, accepted))
+            self._queue_cv.notify()
+
+    def stop(self):
+        with self._queue_cv:
+            self._stop = True
+            self._queue_cv.notify_all()
+
+    # ---- internals ----------------------------------------------------------
+    def _dispatcher_loop(self):
+        while True:
+            with self._queue_cv:
+                while not self._heap and not self._stop:
+                    self._queue_cv.wait()
+                if self._stop and not self._heap:
+                    return
+                priority, _seq, zone, accepted = heapq.heappop(self._heap)
+
+            # Blocks here if all move-slots are busy - THIS is what enforces
+            # "only 1 (or 2) servos move at once", regardless of queue order.
+            self._move_slots.acquire()
+            threading.Thread(target=self._run_one_move, args=(zone, accepted),
+                              daemon=True).start()
+
+    def _run_one_move(self, zone: str, accepted: bool):
+        try:
+            self._move_single_zone(zone, accepted)
+        finally:
+            with self._queue_cv:
+                self._pending_zones.discard(zone)
+            self._move_slots.release()
+
+    def _move_single_zone(self, zone: str, accepted: bool):
+        """HOME -> target -> hold -> HOME. Kept as short as possible on
+        purpose (Section 18: 1 s action-cycle budget)."""
+        target_angle = self.cfg["angle_accepted"] if accepted else self.cfg["angle_rejected"]
+        self.set_angle(zone, target_angle)
+        time.sleep(self.cfg["return_delay_s"])
+        self.set_angle(zone, self.cfg["angle_home"])
 
     def set_angle(self, zone: str, angle: float):
         channel = MOTOR_CHANNEL[zone]
@@ -612,15 +875,6 @@ class ServoController:
                 self.kit.servo[channel].angle = angle
             else:
                 print(f"[servo:sim] {zone} (ch {channel}) -> {angle:.0f} deg")
-
-    def dispatch(self, zone: str, accepted: bool):
-        """Section 12: only the ACTION_NODE for this zone may move hardware."""
-        if accepted:
-            self.set_angle(zone, self.cfg["accept_angle"])
-        else:
-            self.set_angle(zone, self.cfg["reject_angle"])
-            time.sleep(self.cfg["return_delay_s"])
-            self.set_angle(zone, self.cfg["accept_angle"])
 
 
 # ==============================================================================
@@ -642,14 +896,78 @@ def zone_rectangles(crop_w: int, crop_h: int, grid_cfg: dict):
     return rects
 
 
-def draw_zone_overlay(img, rects):
-    """Debug/HMI overlay - red grid lines + zone labels, same look as
-    distances.py / frames_test.py's draw_grid()."""
+ZONE_STATUS_COLOR_BGR = {
+    "IDLE": (140, 140, 140),
+    "ACCEPTED": (0, 220, 0),
+    "REJECTED": (0, 0, 230),
+}
+
+
+def draw_zone_overlay(img, rects, motors_status=None):
+    """Debug/HMI overlay - zone grid lines + labels, colour-coded by each
+    zone's last decision (grey=idle, green=accepted, red=rejected) so the
+    live feed shows both what the camera sees AND what the system decided."""
+    status_by_zone = {m["zone"]: m for m in (motors_status or [])}
     for zone, (x1, y1, x2, y2) in rects.items():
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(img, zone, (x1 + 6, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (0, 255, 255), 2, cv2.LINE_AA)
+        m = status_by_zone.get(zone)
+        last_action = m["last_action"] if m else "IDLE"
+        active = m["active"] if m else False
+        color = ZONE_STATUS_COLOR_BGR.get(last_action, ZONE_STATUS_COLOR_BGR["IDLE"])
+        thickness = 4 if active else 2
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        label = f"{zone}: {last_action}" if last_action != "IDLE" else zone
+        cv2.putText(img, label, (x1 + 6, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 255), 2, cv2.LINE_AA)
     return img
+
+
+class VideoStreamBuffer:
+    """Thread-safe holder for the latest JPEG-encoded annotated frame,
+    consumed by the Flask /video_feed MJPEG endpoint."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jpeg_bytes = None
+
+    def set_frame(self, jpeg_bytes: bytes):
+        with self._lock:
+            self._jpeg_bytes = jpeg_bytes
+
+    def get_frame(self):
+        with self._lock:
+            return self._jpeg_bytes
+
+
+def video_stream_node(framebuf: "FrameBuffer", state: "SharedState", rects: dict,
+                       stream_buf: VideoStreamBuffer, stop_event: threading.Event, cfg: dict):
+    """'Let me see what the camera sees, and what it does': continuously
+    composites the live cropped colour frame with the zone grid and each
+    zone's live accept/reject status, JPEG-encodes it, and publishes it to
+    the dashboard's /video_feed. This is purely a viewer - it does not feed
+    back into any decision."""
+    sc = cfg["camera_stream"]
+    if not sc["enabled"]:
+        return
+    period = 1.0 / max(sc["target_fps"], 1)
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), sc["jpeg_quality"]]
+    while not stop_event.is_set():
+        color, _depth, _fid = framebuf.get()
+        if color is None:
+            time.sleep(period)
+            continue
+        frame = color.copy()
+        if sc["show_zone_grid"]:
+            draw_zone_overlay(frame, rects, state.motor_status_array())
+        if sc["show_status_banner"]:
+            banner = (f"ACCEPTED {state.batch_accepted}   REJECTED {state.batch_rejected}   "
+                      f"PACKAGES {state.completed_packages}   IN VISION ZONE {state.active_zone_count()}")
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 34), (20, 20, 20), -1)
+            cv2.putText(frame, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65, (0, 255, 136), 2, cv2.LINE_AA)
+        ok, jpeg = cv2.imencode(".jpg", frame, encode_params)
+        if ok:
+            stream_buf.set_frame(jpeg.tobytes())
+        time.sleep(period)
 
 
 # ==============================================================================
@@ -715,7 +1033,7 @@ class CameraSystem:
         """Offline/dev-mode stand-in: a belt-coloured background with a few
         randomly-placed, randomly-blemished circular 'pears' drifting through
         frame, so the full CV/decision/DB/dashboard pipeline is exercisable
-        without the physical rig."""
+        without the physical rig attached."""
         dev = self.dev_cfg
         w, h = self.cfg["color_width"], self.cfg["color_height"]
         color = np.full((h, w, 3), (60, 90, 40), dtype=np.uint8)   # dull belt green
@@ -759,6 +1077,50 @@ class CameraSystem:
 
 
 # ==============================================================================
+# EMPTY-BELT BACKGROUND MODEL  -  Section 19: "be ready for empty all the
+# time". Learns what the empty gantry/slot (3D-printed frame + fabric flaps,
+# no pear present) looks like per zone at startup, then keeps slowly
+# adapting during confirmed-empty periods so the black frame texture is
+# never mistaken for a pear, and lighting drift doesn't cause false
+# detections later in a shift.
+# ==============================================================================
+class BackgroundModel:
+    def __init__(self, learn_frames: int, update_alpha: float):
+        self.learn_frames = learn_frames
+        self.update_alpha = update_alpha
+        self._mean = None          # float32 running-average background image
+        self._learned_frames = 0
+
+    def is_ready(self):
+        return self._learned_frames >= self.learn_frames
+
+    def observe_empty(self, zone_bgr):
+        """Feed a frame known/assumed to be empty (background only)."""
+        f = zone_bgr.astype(np.float32)
+        if self._mean is None:
+            self._mean = f.copy()
+            self._learned_frames = 1
+        elif self._learned_frames < self.learn_frames:
+            self._learned_frames += 1
+            self._mean = (self._mean * (self._learned_frames - 1) + f) / self._learned_frames
+        else:
+            cv2.accumulateWeighted(f, self._mean, self.update_alpha)
+
+    def foreground_mask(self, zone_bgr, diff_threshold):
+        """Returns a binary mask of pixels that differ from the learned
+        empty-belt background by more than diff_threshold. Until the model
+        is ready, returns an all-zero mask so nothing false-triggers before
+        the empty gantry/fabric-flap texture has actually been learned."""
+        if self._mean is None:
+            return np.zeros(zone_bgr.shape[:2], dtype=np.uint8)
+        bg = self._mean.astype(np.uint8)
+        diff = cv2.absdiff(zone_bgr, bg)
+        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray_diff, diff_threshold, 255, cv2.THRESH_BINARY)
+        return mask
+
+
+# ==============================================================================
 # 9-STEP CLASSICAL CV PIPELINE  -  Section 6.1, real OpenCV implementation.
 #   1) ROI crop (done by the caller via zone_rectangles)
 #   2) BGR -> LAB colour-space conversion
@@ -770,7 +1132,7 @@ class CameraSystem:
 #   8) Infection colour-mask detection inside the pear silhouette
 #   9) Feature aggregation -> infection_ratio
 # ==============================================================================
-def run_classical_vision(zone_bgr, vcfg):
+def run_classical_vision(zone_bgr, vcfg, fg_mask=None):
     lab = cv2.cvtColor(zone_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=vcfg["clahe_clip"], tileGridSize=vcfg["clahe_tile"])
@@ -787,6 +1149,13 @@ def run_classical_vision(zone_bgr, vcfg):
     kernel = np.ones((k, k), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    if fg_mask is not None:
+        # Section 19: only trust silhouette pixels that ALSO differ from the
+        # learned empty-belt background - this is what keeps the black
+        # 3D-printed frame / fabric flaps from ever being read as a pear,
+        # regardless of their own saturation/texture.
+        mask = cv2.bitwise_and(mask, fg_mask)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -860,6 +1229,32 @@ def shape_gate_score(pear_contour, pear_mask, hsv_zone, gate_cfg):
     return checks >= gate_cfg["min_checks_passed"]
 
 
+def color_gate_score(zone_bgr, pear_mask, vcfg):
+    """Section 19: reject anything that doesn't look like a pear, colour-
+    wise. Computes what fraction of the candidate silhouette's pixels fall
+    inside the configured pear hue/sat/val band(s); hands, tools, cables,
+    belt debris, packaging, etc. will have a low match ratio here and get
+    rejected regardless of what the shape gate or infection check say."""
+    hsv = cv2.cvtColor(zone_bgr, cv2.COLOR_BGR2HSV)
+    sat_val_lo = np.array([0, vcfg["pear_sat_min"], vcfg["pear_val_min"]], dtype=np.uint8)
+    sat_val_hi = np.array([179, 255, 255], dtype=np.uint8)
+    sat_val_mask = cv2.inRange(hsv, sat_val_lo, sat_val_hi)
+
+    hue = hsv[:, :, 0]
+    hue_mask = np.zeros(hue.shape, dtype=np.uint8)
+    for hue_lo, hue_hi in vcfg["pear_hue_ranges"]:
+        hue_mask |= cv2.inRange(hue, hue_lo, hue_hi)
+
+    color_mask = cv2.bitwise_and(hue_mask, sat_val_mask)
+    color_mask = cv2.bitwise_and(color_mask, pear_mask)
+
+    pear_px = int(np.count_nonzero(pear_mask))
+    if pear_px == 0:
+        return False, 0.0
+    match_ratio = float(np.count_nonzero(color_mask)) / pear_px
+    return match_ratio >= vcfg["min_color_match_ratio"], match_ratio
+
+
 def estimate_volume_mass(depth_m, pear_mask, working_distance_mm, px_to_mm2, mass_cfg):
     """Section 8.3: Volume = sum(pixel_area_mm2 * height_above_belt_mm), then
     Section 8.4: Mass_g = rho * Volume_cm3 + b."""
@@ -923,12 +1318,16 @@ def zone_pipeline(zone: str, lane: int, rect, framebuf: FrameBuffer, state: Shar
     init_event.wait()   # Section 18: classical_vision_initialization must run first
     x1, y1, x2, y2 = rect
     vcfg = cfg["vision"]
+    bgcfg = cfg["background_model"]
+    bg_model = BackgroundModel(bgcfg["learn_frames"], bgcfg["update_alpha"])
     was_occupied = False
     last_publish = 0.0
     cooldown = cfg["servo"]["occupancy_cooldown_s"]
     is_row_a = zone.startswith("A")
     poll_s = cfg["timing"]["zone_poll_interval_s"]
     idle_s = cfg["timing"]["idle_sleep_s"]
+
+    print(f"[{zone}] learning empty-belt background ({bgcfg['learn_frames']} frames)...")
 
     while not stop_event.is_set():
         color, depth, _fid = framebuf.get()
@@ -941,13 +1340,33 @@ def zone_pipeline(zone: str, lane: int, rect, framebuf: FrameBuffer, state: Shar
             time.sleep(idle_s)
             continue
 
+        # --- Section 19: background-subtraction gate ------------------------
+        # While the background model is still being learned, or while the
+        # zone is confirmed empty, feed it the frame and go straight to the
+        # next loop iteration. This is what keeps the system reading the
+        # bare gantry/fabric-flap frame as "empty" all the time, instead of
+        # ever mistaking its texture for a pear.
+        fg_mask = bg_model.foreground_mask(zone_bgr, bgcfg["diff_threshold"])
+        fg_px = int(np.count_nonzero(fg_mask)) if bg_model.is_ready() else 0
+        candidate_present = bg_model.is_ready() and fg_px >= bgcfg["min_foreground_px"]
+
+        if not candidate_present:
+            if not was_occupied:
+                # Only adapt the background while nothing is/was there -
+                # never learn a resting pear into the background.
+                bg_model.observe_empty(zone_bgr)
+            was_occupied = False
+            time.sleep(poll_s)
+            continue
+
         cycle_start = time.time()
-        result = run_classical_vision(zone_bgr, vcfg)
+        result = run_classical_vision(zone_bgr, vcfg, fg_mask=fg_mask)
         occupied = result is not None
         now = time.time()
 
         # rising-edge occupancy + per-zone cooldown, Section 19.5.5
-        if occupied and not was_occupied and (now - last_publish) >= cooldown:
+        # Continuous occupancy + per-zone cooldown
+        if occupied and (now - last_publish) >= cooldown:
             state.set_active(zone, True)
             pear_id = state.next_pear_id(zone)
             if is_row_a:
@@ -960,12 +1379,24 @@ def zone_pipeline(zone: str, lane: int, rect, framebuf: FrameBuffer, state: Shar
             hsv_zone = cv2.cvtColor(zone_bgr, cv2.COLOR_BGR2HSV)
             is_pear_shape_ok = shape_gate_score(
                 result["pear_contour"], result["pear_mask"], hsv_zone, SHAPE_GATE)
+            is_pear_color_ok, color_match_ratio = color_gate_score(
+                zone_bgr, result["pear_mask"], vcfg)
             infection_ratio = result["infection_ratio"]
             classical_bad = infection_ratio > vcfg["infection_ratio_threshold"]
 
-            # Section 7.1 decision fusion: ACCEPT only if the shape/colour
-            # gate AND the classical-vision infection check both say GOOD.
-            accepted = is_pear_shape_ok and not classical_bad
+            # Section 7.1 decision fusion: ACCEPT only if the shape gate,
+            # the colour gate ("is this actually pear-coloured, or is it
+            # some unknown object?"), AND the classical infection check all
+            # say GOOD.
+            accepted = is_pear_shape_ok and is_pear_color_ok and not classical_bad
+            if not is_pear_color_ok:
+                reject_reason = "UNKNOWN_OBJECT_COLOR"
+            elif not is_pear_shape_ok:
+                reject_reason = "SHAPE"
+            elif classical_bad:
+                reject_reason = "INFECTED"
+            else:
+                reject_reason = None
             status = "ACCEPTED" if accepted else "REJECTED"
 
             volume_cm3, mass_g = estimate_volume_mass(
@@ -992,11 +1423,20 @@ def zone_pipeline(zone: str, lane: int, rect, framebuf: FrameBuffer, state: Shar
             elapsed = time.time() - cycle_start
             budget = cfg["action_cycle_budget_s"]
             flag = "" if elapsed <= budget else "  !! OVER 1s ACTION-CYCLE BUDGET !!"
+            reason_txt = f" reason={reject_reason}" if reject_reason else ""
             print(f"[{zone}] {pear_id} {status}/{category} ratio={infection_ratio:.3f} "
-                  f"mass={mass_g:.1f}g  ({elapsed*1000:.0f} ms){flag}")
+                  f"color_match={color_match_ratio:.2f} mass={mass_g:.1f}g "
+                  f"({elapsed*1000:.0f} ms){reason_txt}{flag}")
 
             last_publish = now
             state.set_active(zone, False, action=status)
+        elif not occupied:
+            # The background-subtraction gate saw a foreground blob, but
+            # classical vision couldn't extract a valid silhouette from it
+            # (shadow, cable, motion blur, vibration) - treat as empty and
+            # keep the background model current.
+            if not was_occupied:
+                bg_model.observe_empty(zone_bgr)
 
         was_occupied = occupied
         time.sleep(poll_s)
@@ -1176,42 +1616,110 @@ class DataCollectionNode:
 # SCADA DASHBOARD  -  Section 15: Flask web publisher on port 8080.
 # Dark IIoT theme, same visual language as the reference SCADA screenshots.
 # ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Shared top navigation bar (logo + page links as real buttons, Section: item 1)
+# used by every dashboard page so navigation is consistent everywhere.
+# ------------------------------------------------------------------------------
+NAV_BAR = """
+<div class="saat-nav">
+  <a class="saat-nav-brand" href="/">
+    <img src="/assets/logo.png" alt="SAAT logo">
+    <span>SAAT <small>Agricultural Technology</small></span>
+  </a>
+  <div class="saat-nav-links">
+    <a class="nav-btn {active_status}" href="/">Status</a>
+    <a class="nav-btn {active_camera}" href="/camera">Camera</a>
+    <a class="nav-btn {active_database}" href="/database">Database</a>
+    <a class="nav-btn {active_labels}" href="/labels">Labels</a>
+    <a class="nav-btn" href="/api/status" target="_blank">API</a>
+  </div>
+</div>
+"""
+
+NAV_BAR_CSS = """
+  .saat-nav{display:flex;align-items:center;justify-content:space-between;
+    flex-wrap:wrap;gap:12px;margin-bottom:20px;padding-bottom:16px;
+    border-bottom:1px solid {{c.border}};}
+  .saat-nav-brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:inherit;}
+  .saat-nav-brand img{height:38px;width:auto;display:block;}
+  .saat-nav-brand span{font-size:16px;font-weight:bold;color:{{c.green}};letter-spacing:1px;}
+  .saat-nav-brand span small{display:block;font-size:9px;font-weight:normal;color:#8b949e;letter-spacing:1.5px;}
+  .saat-nav-links{display:flex;gap:8px;flex-wrap:wrap;}
+  .nav-btn{background:{{c.surface}};border:1px solid {{c.border}};color:#c9d1d9;
+    padding:8px 16px;border-radius:6px;font-size:12px;text-decoration:none;
+    text-transform:uppercase;letter-spacing:0.5px;transition:all .15s ease;}
+  .nav-btn:hover{border-color:{{c.blue}};color:{{c.blue}};}
+  .nav-btn.active{background:{{c.blue}};border-color:{{c.blue}};color:#fff;}
+  .btn{display:inline-flex;align-items:center;gap:6px;background:{{c.blue}};color:#fff;
+    border:none;padding:9px 16px;border-radius:6px;font-size:12px;text-decoration:none;
+    cursor:pointer;font-family:inherit;text-transform:uppercase;letter-spacing:0.5px;}
+  .btn:hover{opacity:0.85;}
+  .btn.secondary{background:{{c.surface}};border:1px solid {{c.border}};color:#c9d1d9;}
+  .btn.green{background:{{c.green}};color:#04140c;}
+  .btn.amber{background:{{c.amber}};color:#241a02;}
+  .toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:4px;}
+"""
+
 STATUS_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="{{ refresh_s }}">
 <title>SAAT SCADA - Status</title>
 <style>
+  *{box-sizing:border-box;}
   body{background:{{c.bg}};color:#e6edf3;font-family:'JetBrains Mono',monospace;margin:0;padding:24px;}
-  h1{color:{{c.green}};font-size:20px;letter-spacing:1px;}
-  .sub{color:#8b949e;font-size:12px;margin-top:-8px;}
+""" + NAV_BAR_CSS + """
+  .hero{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:18px;}
+  .hero-title{font-size:13px;color:#8b949e;text-transform:uppercase;letter-spacing:1.5px;}
+  .hw-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:11px;
+    letter-spacing:0.5px;text-transform:uppercase;}
+  .hw-pill.on{background:rgba(0,255,136,0.12);color:{{c.green}};border:1px solid {{c.green}};}
+  .hw-pill.off{background:rgba(245,158,11,0.12);color:{{c.amber}};border:1px solid {{c.amber}};}
+  .hw-pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor;}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:16px;}
-  .card{background:{{c.surface}};border:1px solid {{c.border}};border-radius:8px;padding:16px;}
-  .card h2{margin:0 0 8px 0;font-size:13px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;}
+  .card{background:{{c.surface}};border:1px solid {{c.border}};border-radius:10px;padding:16px;
+    box-shadow:0 1px 3px rgba(0,0,0,0.25);}
+  .card h2{margin:0 0 10px 0;font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;
+    display:flex;align-items:center;gap:6px;}
   .val{font-size:26px;font-weight:bold;}
   .accepted{color:{{c.green}};} .rejected{color:{{c.red}};}
   .amber{color:{{c.amber}};} .blue{color:{{c.blue}};}
   table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px;}
-  td,th{border-bottom:1px solid {{c.border}};padding:4px 8px;text-align:left;}
+  td,th{border-bottom:1px solid {{c.border}};padding:6px 8px;text-align:left;}
+  th{color:#8b949e;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;}
   a{color:{{c.blue}};text-decoration:none;}
-  .footer{margin-top:24px;color:#484f58;font-size:11px;}
-  .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;}
+  .section-title{font-size:13px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;margin:24px 0 8px 0;}
+  .footer{margin-top:20px;color:#484f58;font-size:11px;}
+  .barwrap{background:#0b0f14;border-radius:6px;height:8px;overflow:hidden;margin-top:8px;border:1px solid {{c.border}};}
+  .barfill{height:100%;border-radius:6px;}
 </style></head><body>
-<h1>&#9679; SAAT SCADA DASHBOARD</h1>
-<div class="sub">{{ 'REAL HARDWARE' if hardware_active else 'OFFLINE / DEV MODE (simulated sensors)' }}</div>
-<div class="grid">
-  <div class="card"><h2>Belt State</h2><div class="val {{ 'accepted' if belt.belt_state=='NORMAL' else ('amber' if belt.belt_state=='EMPTY' else 'rejected') }}">{{ belt.belt_state or '-' }}</div></div>
-  <div class="card"><h2>Conv1 Voltage</h2><div class="val blue">{{ '%.3f'|format(belt.conv1_v or 0) }} V</div></div>
-  <div class="card"><h2>Conv2 Voltage</h2><div class="val blue">{{ '%.3f'|format(belt.conv2_v or 0) }} V</div></div>
-  <div class="card"><h2>Sum (must = 3.30 V)</h2><div class="val {{ 'accepted' if (belt.conv1_v or 0)+(belt.conv2_v or 0) > 3.25 else 'rejected' }}">{{ '%.3f'|format((belt.conv1_v or 0)+(belt.conv2_v or 0)) }} V</div></div>
-  <div class="card"><h2>Reference Speed</h2><div class="val">{{ '%.4f'|format(belt.reference_speed_ms or 0) }} m/s</div></div>
-  <div class="card"><h2>Pear Count (Vision Zone)</h2><div class="val">{{ belt.pear_count or 0 }} / 6</div></div>
-  <div class="card"><h2>Accepted</h2><div class="val accepted">{{ batch_accepted }}</div></div>
-  <div class="card"><h2>Rejected</h2><div class="val rejected">{{ batch_rejected }}</div></div>
-  <div class="card"><h2>Completed Packages</h2><div class="val amber"><a href="/labels" style="color:inherit;">{{ completed_packages }}</a></div></div>
+""" + NAV_BAR.replace("{active_status}", "active").replace("{active_camera}", "") \
+              .replace("{active_database}", "").replace("{active_labels}", "") + """
+
+<div class="hero">
+  <div class="hero-title">Live production status</div>
+  <div class="hw-pill {{ 'on' if hardware_active else 'off' }}">
+    <span class="dot"></span>{{ 'REAL HARDWARE' if hardware_active else 'OFFLINE / DEV MODE (simulated sensors)' }}
+  </div>
 </div>
 
-<div class="card" style="margin-top:16px;">
-  <h2>Motor / Zone Status</h2>
+<div class="grid">
+  <div class="card"><h2>&#9881;&#65039; Belt State</h2><div class="val {{ 'accepted' if belt.belt_state=='NORMAL' else ('amber' if belt.belt_state=='EMPTY' else 'rejected') }}">{{ belt.belt_state or '-' }}</div></div>
+  <div class="card"><h2>&#9889; Conv1 Voltage</h2><div class="val blue">{{ '%.3f'|format(belt.conv1_v or 0) }} V</div>
+    <div class="barwrap"><div class="barfill" style="width:{{ ((belt.conv1_v or 0)/3.3*100)|round(1) }}%;background:{{c.blue}};"></div></div></div>
+  <div class="card"><h2>&#9889; Conv2 Voltage</h2><div class="val blue">{{ '%.3f'|format(belt.conv2_v or 0) }} V</div>
+    <div class="barwrap"><div class="barfill" style="width:{{ ((belt.conv2_v or 0)/3.3*100)|round(1) }}%;background:{{c.blue}};"></div></div></div>
+  <div class="card"><h2>&#10003; Sum (must = 3.30 V)</h2><div class="val {{ 'accepted' if (belt.conv1_v or 0)+(belt.conv2_v or 0) > 3.25 else 'rejected' }}">{{ '%.3f'|format((belt.conv1_v or 0)+(belt.conv2_v or 0)) }} V</div></div>
+  <div class="card"><h2>&#128664; Reference Speed</h2><div class="val">{{ '%.4f'|format(belt.reference_speed_ms or 0) }} m/s</div></div>
+  <div class="card"><h2>&#127820; Pear Count (Vision Zone)</h2><div class="val">{{ belt.pear_count or 0 }} / 6</div>
+    <div class="barwrap"><div class="barfill" style="width:{{ ((belt.pear_count or 0)/6*100)|round(1) }}%;background:{{c.amber}};"></div></div></div>
+  <div class="card"><h2>&#9989; Accepted</h2><div class="val accepted">{{ batch_accepted }}</div></div>
+  <div class="card"><h2>&#10060; Rejected</h2><div class="val rejected">{{ batch_rejected }}</div></div>
+  <div class="card"><h2>&#128230; Completed Packages</h2><div class="val amber"><a href="/labels" style="color:inherit;">{{ completed_packages }}</a></div></div>
+</div>
+
+<div class="section-title">Motor / Zone Status</div>
+<div class="card">
   <table><tr><th>Zone</th><th>Active</th><th>Last Action</th></tr>
   {% for m in motors_status %}
   <tr><td>{{m.zone}}</td><td>{{ 'YES' if m.active else 'no' }}</td>
@@ -1219,8 +1727,8 @@ STATUS_PAGE = """
   {% endfor %}</table>
 </div>
 
-<div class="card" style="margin-top:16px;">
-  <h2>Last Pear Record</h2>
+<div class="section-title">Last Pear Record</div>
+<div class="card">
   {% if pear_id %}
   <table>
     <tr><td>pear_id</td><td>{{pear_id}}</td></tr>
@@ -1237,9 +1745,12 @@ STATUS_PAGE = """
 </div>
 
 <div class="footer">
-  <a href="/database">/database</a> &nbsp;|&nbsp; <a href="/labels">/labels</a> &nbsp;|&nbsp;
-  <a href="/api/status">/api/status</a>
-  &nbsp;|&nbsp; auto-refresh every 10s &nbsp;|&nbsp; updated {{ now }}
+  auto-refresh every {{ refresh_s }}s &nbsp;|&nbsp; updated {{ now }}
+  {% if public_url %}
+    &nbsp;|&nbsp; Public URL: <a href="{{ public_url }}" target="_blank">{{ public_url }}</a>
+  {% else %}
+    &nbsp;|&nbsp; Public URL: <span style="color:{{c.amber}};">connecting via Cloudflare tunnelâ¦</span>
+  {% endif %}
 </div>
 </body></html>
 """
@@ -1248,20 +1759,117 @@ DATABASE_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
 <title>SAAT SCADA - Database</title>
 <style>
+  *{box-sizing:border-box;}
   body{background:{{c.bg}};color:#e6edf3;font-family:'JetBrains Mono',monospace;margin:0;padding:24px;}
-  h1{color:{{c.green}};font-size:20px;}
-  table{width:100%;border-collapse:collapse;font-size:12px;margin-top:16px;}
-  td,th{border-bottom:1px solid {{c.border}};padding:4px 8px;text-align:left;white-space:nowrap;}
-  th{color:#8b949e;text-transform:uppercase;font-size:11px;}
+""" + NAV_BAR_CSS + """
+  h1{color:{{c.green}};font-size:18px;margin:0 0 4px 0;}
+  .sub{color:#8b949e;font-size:12px;margin-bottom:14px;}
+  .card{background:{{c.surface}};border:1px solid {{c.border}};border-radius:10px;padding:14px;overflow-x:auto;}
+  table{width:100%;border-collapse:collapse;font-size:12px;}
+  td,th{border-bottom:1px solid {{c.border}};padding:6px 8px;text-align:left;white-space:nowrap;}
+  th{color:#8b949e;text-transform:uppercase;font-size:11px;position:sticky;top:0;background:{{c.surface}};}
   .ACCEPTED{color:{{c.green}};} .REJECTED{color:{{c.red}};}
   a{color:{{c.blue}};}
 </style></head><body>
-<h1>&#128190; pear_records - {{ row_limit }} most recent</h1>
-<p><a href="/">&larr; back to status</a></p>
+""" + NAV_BAR.replace("{active_status}", "").replace("{active_camera}", "") \
+              .replace("{active_database}", "active").replace("{active_labels}", "") + """
+
+<h1>&#128190; pear_records</h1>
+<div class="sub">Showing the {{ row_limit }} most recent rows. Use the buttons below to export the full table.</div>
+
+<div class="toolbar" style="margin-bottom:16px;">
+  <a class="btn green" href="/download/database/all.xlsx">&#11015;&#65039; Download All (Excel)</a>
+  <a class="btn amber" href="/download/database/today.xlsx">&#128197; Download Today (Excel)</a>
+</div>
+
+<div class="card">
 <table><tr>{% for col in columns %}<th>{{col}}</th>{% endfor %}</tr>
 {% for row in rows %}<tr>{% for i in range(row|length) %}
 <td class="{{ row[3] if i==3 else '' }}">{{ row[i] }}</td>{% endfor %}</tr>{% endfor %}
 </table>
+</div>
+</body></html>
+"""
+
+CAMERA_PAGE = """
+<!doctype html><html><head><meta charset="utf-8">
+<title>SAAT - Live Camera</title>
+<style>
+  *{box-sizing:border-box;}
+  body{background:{{c.bg}};color:#e6edf3;font-family:'JetBrains Mono',monospace;margin:0;padding:24px;}
+""" + NAV_BAR_CSS + """
+  h1{color:{{c.green}};font-size:18px;letter-spacing:1px;margin:0 0 4px 0;}
+  p{color:#8b949e;font-size:12px;}
+  a{color:{{c.blue}};text-decoration:none;}
+  .cam-wrap{display:flex;flex-direction:column;align-items:center;margin-top:8px;}
+  .frame{max-width:900px;width:100%;border:1px solid {{c.border}};border-radius:10px;background:#000;
+    box-shadow:0 4px 18px rgba(0,0,0,0.35);}
+  .legend{margin-top:14px;font-size:12px;color:#8b949e;display:flex;gap:20px;}
+  .swatch{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:middle;}
+  .details-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-top:28px;}
+  .card{background:{{c.surface}};border:1px solid {{c.border}};border-radius:10px;padding:16px;}
+  .card h2{margin:0 0 10px 0;font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;}
+  .card table{width:100%;font-size:12px;border-collapse:collapse;}
+  .card td{padding:4px 0;border-bottom:1px solid {{c.border}};}
+  .card td:last-child{text-align:right;color:{{c.blue}};font-weight:bold;}
+  .section-title{font-size:13px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px 0;text-align:center;}
+  .bg-pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:14px;font-size:10px;
+    letter-spacing:0.5px;text-transform:uppercase;margin-left:6px;}
+  .bg-pill.ready{background:rgba(0,255,136,0.12);color:{{c.green}};border:1px solid {{c.green}};}
+  .bg-pill.learning{background:rgba(245,158,11,0.12);color:{{c.amber}};border:1px solid {{c.amber}};}
+</style></head><body>
+""" + NAV_BAR.replace("{active_status}", "").replace("{active_camera}", "active") \
+              .replace("{active_database}", "").replace("{active_labels}", "") + """
+
+<h1>&#128247; What The Camera Sees</h1>
+<p>Live zone-annotated feed from the Intel RealSense D455, ~{{ fps }} fps &nbsp;|&nbsp; {{ 'REAL HARDWARE' if hardware_active else 'OFFLINE / DEV MODE (simulated frames)' }}</p>
+
+<div class="cam-wrap">
+  <img class="frame" src="/video_feed">
+  <div class="legend">
+    <div><span class="swatch" style="background:#8c8c8c;"></span>idle / no pear</div>
+    <div><span class="swatch" style="background:{{c.green}};"></span>accepted</div>
+    <div><span class="swatch" style="background:{{c.red}};"></span>rejected</div>
+  </div>
+</div>
+
+<div class="section-title" style="margin-top:32px;">System Details</div>
+<div class="details-grid">
+  <div class="card">
+    <h2>&#128247; Camera</h2>
+    <table>
+      <tr><td>Colour stream</td><td>{{cam.color_width}}x{{cam.color_height}} @ {{cam.color_fps}} fps</td></tr>
+      <tr><td>Depth stream</td><td>{{cam.depth_width}}x{{cam.depth_height}} @ {{cam.depth_fps}} fps</td></tr>
+      <tr><td>Working distance</td><td>{{cam.working_distance_mm}} mm</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h2>&#127820; Vision Thresholds</h2>
+    <table>
+      <tr><td>Infection ratio limit</td><td>{{ (vision.infection_ratio_threshold*100)|round(1) }}%</td></tr>
+      <tr><td>Min pear area</td><td>{{vision.min_pear_area_px}} px&sup2;</td></tr>
+      <tr><td>BIG / SMALL cutoff</td><td>{{big_small_threshold}} px&sup2;</td></tr>
+      <tr><td>Shape checks required</td><td>{{shape_min_checks}} / 4</td></tr>
+      <tr><td>Min colour match ratio</td><td>{{ (vision.min_color_match_ratio*100)|round(0) }}%</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h2>&#8987; Timing</h2>
+    <table>
+      <tr><td>Action-cycle budget</td><td>{{action_cycle_budget}} s</td></tr>
+      <tr><td>Zone occupancy cooldown</td><td>{{occupancy_cooldown}} s</td></tr>
+      <tr><td>Max pears in vision zone</td><td>{{max_pears}}</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h2>&#9881;&#65039; Zones (A1-B3)</h2>
+    <table>
+      {% for m in motors_status %}
+      <tr><td>{{m.zone}}</td><td class="{{ 'accepted' if m.last_action=='ACCEPTED' else ('rejected' if m.last_action=='REJECTED' else '') }}" style="color:inherit;">{{m.last_action}}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
 </body></html>
 """
 
@@ -1269,28 +1877,47 @@ LABELS_INDEX_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
 <title>SAAT SCADA - Package Labels</title>
 <style>
+  *{box-sizing:border-box;}
   body{background:{{c.bg}};color:#e6edf3;font-family:'JetBrains Mono',monospace;margin:0;padding:24px;}
-  h1{color:{{c.green}};font-size:20px;}
-  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:16px;}
-  td,th{border-bottom:1px solid {{c.border}};padding:6px 10px;text-align:left;}
+""" + NAV_BAR_CSS + """
+  h1{color:{{c.green}};font-size:18px;margin:0 0 4px 0;}
+  .sub{color:#8b949e;font-size:12px;margin-bottom:14px;}
+  .card{background:{{c.surface}};border:1px solid {{c.border}};border-radius:10px;padding:14px;overflow-x:auto;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  td,th{border-bottom:1px solid {{c.border}};padding:8px 10px;text-align:left;}
   th{color:#8b949e;text-transform:uppercase;font-size:11px;}
   a{color:{{c.blue}};text-decoration:none;}
   a:hover{text-decoration:underline;}
+  .row-btn{display:inline-block;padding:5px 10px;border-radius:5px;font-size:11px;text-transform:uppercase;
+    letter-spacing:0.5px;border:1px solid {{c.border}};background:{{c.bg}};margin-right:6px;}
+  .row-btn:hover{border-color:{{c.blue}};}
   .empty{color:#8b949e;margin-top:16px;}
 </style></head><body>
-<h1>&#127991; Package Labels - completed packages (12 BIG + 12 SMALL each)</h1>
-<p><a href="/">&larr; back to status</a></p>
+""" + NAV_BAR.replace("{active_status}", "").replace("{active_camera}", "") \
+              .replace("{active_database}", "").replace("{active_labels}", "active") + """
+
+<h1>&#127991; Package Labels</h1>
+<div class="sub">Completed packages (12 BIG + 12 SMALL each). Click a package to view or download its printable label.</div>
+
 {% if packages %}
+<div class="toolbar" style="margin-bottom:16px;">
+  <a class="btn green" href="/download/labels/all.csv">&#11015;&#65039; Download All Labels (CSV)</a>
+</div>
+<div class="card">
 <table>
 <tr><th>Package ID</th><th>Completed At</th><th>Packaging Clock</th><th>Upper (BIG) g</th><th>Lower (SMALL) g</th><th>Total g</th><th></th></tr>
 {% for p in packages %}
 <tr>
   <td>{{p.package_id}}</td><td>{{p.completed_at}}</td><td>{{p.duration}}</td>
   <td>{{p.upper_weight_g}}</td><td>{{p.lower_weight_g}}</td><td>{{p.total_weight_g}}</td>
-  <td><a href="/labels/{{p.package_id}}">print label &rarr;</a></td>
+  <td>
+    <a class="row-btn" href="/labels/{{p.package_id}}">View / Print</a>
+    <a class="row-btn" href="/download/labels/{{p.package_id}}.csv">Download</a>
+  </td>
 </tr>
 {% endfor %}
 </table>
+</div>
 {% else %}
 <div class="empty">No packages completed yet - each package needs 12 BIG + 12 SMALL accepted pears.</div>
 {% endif %}
@@ -1301,13 +1928,21 @@ LABEL_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
 <title>Label - {{package_id}}</title>
 <style>
+  *{box-sizing:border-box;}
   body{background:#e9edf1;color:#111;font-family:'JetBrains Mono',monospace;margin:0;padding:24px;}
-  .backlink{display:block;margin-bottom:16px;color:#3b82f6;text-decoration:none;font-size:13px;}
+  .toolbar-row{width:980px;margin:0 auto 16px auto;display:flex;justify-content:space-between;align-items:center;}
+  .backlink{color:#3b82f6;text-decoration:none;font-size:13px;}
+  .print-btn{background:#111;color:#fff;border:none;padding:9px 18px;border-radius:6px;font-size:12px;
+    text-transform:uppercase;letter-spacing:0.5px;cursor:pointer;font-family:inherit;}
+  .print-btn:hover{opacity:0.85;}
   .label-master{background:#fff;border:3px solid #111;width:980px;margin:0 auto 32px auto;}
-  .mh-top{border-bottom:3px solid #111;padding:10px 16px;text-align:right;font-size:22px;font-weight:bold;letter-spacing:2px;}
+  .mh-top{border-bottom:3px solid #111;padding:10px 16px;display:flex;align-items:center;justify-content:flex-end;gap:10px;}
+  .mh-top img{height:34px;width:auto;}
+  .mh-top span{font-size:22px;font-weight:bold;letter-spacing:2px;}
   .mh-body{display:grid;grid-template-columns:1fr 1fr 260px;}
   .layer-col{padding:16px;border-right:2px solid #111;}
   .info-col{padding:16px;display:flex;flex-direction:column;gap:14px;align-items:center;}
+  .info-col img{height:56px;width:auto;margin-bottom:2px;}
   .layer-title{text-align:center;font-weight:bold;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;}
   .pear-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;}
   .pear-cell{border:1px solid #111;padding:8px 2px;text-align:center;font-size:11px;line-height:1.4;}
@@ -1319,14 +1954,25 @@ LABEL_PAGE = """
   h2.section{width:980px;margin:24px auto 8px auto;font-size:15px;color:#333;}
   .pear-labels-grid{width:980px;margin:0 auto;display:flex;flex-wrap:wrap;gap:10px;}
   .pear-label{display:flex;width:230px;height:60px;border:2px solid #111;background:#fff;}
+  .pear-label img{height:28px;width:auto;align-self:center;margin-left:8px;}
   .pear-label .info{flex:1;padding:6px 8px;display:flex;flex-direction:column;justify-content:center;font-size:11px;gap:4px;}
   .pear-label .info b{font-size:12px;}
   .cat-BIG{border-left:6px solid #3b82f6;}
   .cat-SMALL{border-left:6px solid #f59e0b;}
+  @media print {
+    .toolbar-row{display:none;}
+    body{background:#fff;padding:0;}
+  }
 </style></head><body>
-<a class="backlink" href="/labels">&larr; back to package list</a>
+<div class="toolbar-row">
+  <a class="backlink" href="/labels">&larr; back to package list</a>
+  <div>
+    <a class="print-btn" href="/download/labels/{{package_id}}.csv" style="text-decoration:none;display:inline-block;margin-right:8px;">&#11015;&#65039; Download CSV</a>
+    <button class="print-btn" onclick="window.print()">&#128424;&#65039; Print / Save PDF</button>
+  </div>
+</div>
 <div class="label-master">
-  <div class="mh-top">SAAT</div>
+  <div class="mh-top"><img src="/assets/logo.png" alt="SAAT logo"><span>SAAT</span></div>
   <div class="mh-body">
     <div class="layer-col">
       <div class="layer-title">Upper Layer (BIG)</div>
@@ -1339,6 +1985,7 @@ LABEL_PAGE = """
       <div class="layer-total">Total Mass: {{lower_weight_g}} g</div>
     </div>
     <div class="info-col">
+      <img src="/assets/logo.png" alt="SAAT logo">
       <div class="info-row"><span class="lbl">Package ID</span><span class="val">{{package_id}}</span></div>
       <div class="info-row"><span class="lbl">Packaging Time</span><span class="val">{{packaging_time}}</span></div>
       <div class="info-row"><span class="lbl">Packaging Clock</span><span class="val">{{packaging_clock}}</span></div>
@@ -1350,6 +1997,7 @@ LABEL_PAGE = """
 <div class="pear-labels-grid">
   {% for item in all_pears %}
   <div class="pear-label cat-{{item.category}}">
+    <img src="/assets/logo.png" alt="SAAT">
     <div class="info"><div>Package: <b>{{package_id}}</b></div><div>Pear ID: <b>{{item.pear_id}}</b></div></div>
   </div>
   {% endfor %}
@@ -1359,10 +2007,12 @@ LABEL_PAGE = """
 
 
 def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
-                     db_path: Path, camera_hardware_active: bool, cfg: dict):
+                     db_path: Path, camera_hardware_active: bool, cfg: dict,
+                     stream_buf: "VideoStreamBuffer"):
     app = Flask(__name__)
     dash = cfg["dashboard"]
     colors = dash["colors"]
+    logo_path = Path(cfg["branding"]["logo_path"]).resolve()
 
     @app.route("/")
     def status():
@@ -1383,7 +2033,11 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
             pear_surface_area=payload.get("pear_surface_area"),
             pear_volume=payload.get("pear_volume"), pear_mass=payload.get("pear_mass"),
             hardware_active=camera_hardware_active,
+            now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            public_url=tunnel.public_url,
             now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    
 
     @app.route("/database")
     def database():
@@ -1399,7 +2053,47 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
     @app.route("/api/status")
     def api_status():
         raw = dc_node.get_iot_status()
-        return jsonify(json.loads(raw) if raw else {})
+        payload = json.loads(raw) if raw else {}
+        payload["public_url"] = tunnel.public_url
+        return jsonify(payload)
+
+    @app.route("/camera")
+    def camera_view():
+        return render_template_string(CAMERA_PAGE, c=colors, fps=cfg["camera_stream"]["target_fps"],
+                                       hardware_active=camera_hardware_active,
+                                       cam=cfg["camera"], vision=cfg["vision"],
+                                       big_small_threshold=cfg["big_small_threshold_px2"],
+                                       shape_min_checks=cfg["shape_gate"]["min_checks_passed"],
+                                       action_cycle_budget=cfg["action_cycle_budget_s"],
+                                       occupancy_cooldown=cfg["servo"]["occupancy_cooldown_s"],
+                                       max_pears=cfg["max_pears_in_vision_zone"],
+                                       motors_status=[])
+
+    @app.route("/video_feed")
+    def video_feed():
+        def generate():
+            idle_wait = 1.0 / max(cfg["camera_stream"]["target_fps"], 1)
+            while True:
+                frame = stream_buf.get_frame()
+                if frame is None:
+                    time.sleep(idle_wait)
+                    continue
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                time.sleep(idle_wait)
+        return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    # --------------------------------------------------------------------
+    # FIX #1: serve the real logo file from disk instead of a hardcoded
+    # base64 placeholder pixel. Put your actual PNG at CONFIG["branding"]
+    # ["logo_path"] (default: static/logo.png, next to this script).
+    # --------------------------------------------------------------------
+    @app.route("/assets/logo.png")
+    def logo():
+        if not logo_path.exists():
+            print(f"[SAAT] WARNING: logo file not found at {logo_path} - "
+                  f"put your real logo there (see CONFIG['branding']['logo_path']).")
+            return Response(status=404)
+        return send_from_directory(logo_path.parent, logo_path.name, mimetype="image/png")
 
     @app.route("/labels")
     def labels_index():
@@ -1438,6 +2132,95 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
             all_pears=all_pears,
             packaging_time=datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S"),
             packaging_clock=f"{mins:02d}:{secs:02d}")
+
+    # --------------------------------------------------------------------
+    # FIX #2: the download/export routes that LABELS_INDEX_PAGE,
+    # LABEL_PAGE, and DATABASE_PAGE link to, but which never existed
+    # before -> every click on those buttons was a 404.
+    # --------------------------------------------------------------------
+    @app.route("/download/labels/all.csv")
+    def download_all_labels():
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute(
+            "SELECT package_id, end_timestamp, upper_layer, lower_layer, total_weight_g "
+            "FROM packages ORDER BY end_timestamp DESC")
+        rows = cur.fetchall()
+        conn.close()
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["package_id", "pear_id", "category", "position", "mass_g", "completed_at"])
+        for package_id, end_ts, upper_json, lower_json, _total_w in rows:
+            completed_at = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S")
+            for item in json.loads(upper_json):
+                w.writerow([package_id, item["pear_id"], "BIG", item["position"],
+                            item["mass_g"], completed_at])
+            for item in json.loads(lower_json):
+                w.writerow([package_id, item["pear_id"], "SMALL", item["position"],
+                            item["mass_g"], completed_at])
+        return Response(out.getvalue(), mimetype="text/csv",
+                         headers={"Content-Disposition": "attachment; filename=all_labels.csv"})
+
+    @app.route("/download/labels/<package_id>.csv")
+    def download_one_label(package_id):
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute(
+            "SELECT upper_layer, lower_layer FROM packages WHERE package_id = ?", (package_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row is None:
+            return f"Package {package_id} not found", 404
+        upper_json, lower_json = row
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["package_id", "pear_id", "category", "position", "mass_g"])
+        for item in json.loads(upper_json):
+            w.writerow([package_id, item["pear_id"], "BIG", item["position"], item["mass_g"]])
+        for item in json.loads(lower_json):
+            w.writerow([package_id, item["pear_id"], "SMALL", item["position"], item["mass_g"]])
+        return Response(out.getvalue(), mimetype="text/csv",
+                         headers={"Content-Disposition": f"attachment; filename={package_id}.csv"})
+
+    def _export_database_xlsx(rows, columns, filename):
+        if not HAVE_OPENPYXL:
+            return Response(
+                "openpyxl is not installed on the server. Run:\n"
+                "    pip install openpyxl\nand try again.",
+                mimetype="text/plain", status=501)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "pear_records"
+        ws.append(columns)
+        for row in rows:
+            ws.append(list(row))
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return Response(
+            buf.read(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+    @app.route("/download/database/all.xlsx")
+    def download_database_all():
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute("SELECT * FROM pear_records ORDER BY timestamp DESC")
+        columns = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        conn.close()
+        return _export_database_xlsx(rows, columns, "pear_records_all.xlsx")
+
+    @app.route("/download/database/today.xlsx")
+    def download_database_today():
+        start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute(
+            "SELECT * FROM pear_records WHERE timestamp >= ? ORDER BY timestamp DESC",
+            (start_of_day,))
+        columns = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        conn.close()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        return _export_database_xlsx(rows, columns, f"pear_records_{today_str}.xlsx")
 
     return app
 
@@ -1481,6 +2264,14 @@ def main():
     print(" SAAT PRODUCTION SYSTEM - Pear Sorting & Packaging Line")
     print(" Vision Subsystem + Control Subsystem, unified single-process launch")
     print("=" * 78)
+
+    # Early heads-up if the real logo file hasn't been dropped in yet, so
+    # this is obvious from the console instead of a silent blank image.
+    logo_path = Path(CONFIG["branding"]["logo_path"])
+    if not logo_path.exists():
+        print(f"[SAAT] NOTE: no logo found at '{logo_path}'. The nav bar / "
+              f"labels will show a broken image until you add your real "
+              f"logo PNG there (or update CONFIG['branding']['logo_path']).")
 
     state = SharedState()
     stop_event = threading.Event()
@@ -1540,15 +2331,25 @@ def main():
     t = threading.Thread(target=dc_node.run, args=(speed_ctrl, stop_event), daemon=True)
     t.start(); threads.append(t)
 
+    # T+5.5: live camera view ("what the camera sees, and what it does")
+    stream_buf = VideoStreamBuffer()
+    if CONFIG["camera_stream"]["enabled"]:
+        print("[SAAT] T+5.5: starting video_stream_node (live /camera view)...")
+        t = threading.Thread(target=video_stream_node,
+                              args=(framebuf, state, rects, stream_buf, stop_event, CONFIG),
+                              daemon=True)
+        t.start(); threads.append(t)
+
     # T+6: SCADA dashboard
     if not args.no_web:
-        app = build_flask_app(dc_node, speed_ctrl, db_path, camera.hardware_active, CONFIG)
+        app = build_flask_app(dc_node, speed_ctrl, db_path, camera.hardware_active, CONFIG, stream_buf, tunnel)
         t = threading.Thread(
             target=lambda: app.run(host="0.0.0.0", port=args.port, debug=False,
                                     use_reloader=False, threaded=True), daemon=True)
         t.start(); threads.append(t)
         time.sleep(0.5)
         print(f"[SAAT] Dashboard : http://localhost:{args.port}")
+        print(f"[SAAT] Live Camera: http://localhost:{args.port}/camera")
         print(f"[SAAT] Database  : http://localhost:{args.port}/database")
         print(f"[SAAT] Labels    : http://localhost:{args.port}/labels")
         print(f"[SAAT] JSON API  : http://localhost:{args.port}/api/status")
@@ -1567,12 +2368,18 @@ def main():
         print("\n[SAAT] Ctrl+C received, stopping...")
     finally:
         stop_event.set()
+        servo.stop()
         conv1.stop(); conv2.stop()
         if HAVE_GPIO:
             GPIO.cleanup()
         camera.stop()
         conn.close()
+        tunnel.stop()
         print("[SAAT] Stopped. Database saved at:", db_path.resolve())
+    # T+6.5: Cloudflare quick tunnel - publishes the local dashboard publicly
+    tunnel = CloudflareTunnel(args.port)
+    if not args.no_web:
+        tunnel.start()
 
 
 if __name__ == "__main__":
