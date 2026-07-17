@@ -89,7 +89,9 @@ import itertools
 import json
 import queue
 import random
+import re
 import sqlite3
+import subprocess
 import threading
 import time
 from collections import deque
@@ -360,6 +362,17 @@ CONFIG = {
     "branding": {
         "logo_path": "static/logo.png",   # <-- put your real logo file here
     },
+
+    # ==========================================================================
+    # 16) PUBLIC TUNNEL  -  Section: auto-publish the local dashboard through
+    #     a Cloudflare quick tunnel (cloudflared) and surface the resulting
+    #     public URL on the status page.
+    # ==========================================================================
+    "tunnel": {
+        "enabled": True,                  # <-- set False to disable auto-tunnelling entirely
+        "provider": "cloudflared",        # only "cloudflared" is implemented right now
+        "cloudflared_path": "cloudflared",  # <-- CALIBRATE: full path if not on PATH
+    },
 }
 
 # Convenience alias so `SHAPE_GATE` keeps working anywhere it's referenced
@@ -379,6 +392,7 @@ RUNTIME_DEFAULTS = {
     "duration": 0.0,          # 0 = run until Ctrl+C
     "db_path": "./saat_data/saat_records.db",
     "force_sim": False,
+    "no_tunnel": False,
 }
 
 
@@ -672,6 +686,81 @@ class VoltageChannel:
         self._thread.join(timeout=1.0)
         if HAVE_GPIO:
             GPIO.output(self.pin, GPIO.LOW)
+
+
+# ==============================================================================
+# CLOUDFLARE TUNNEL  -  launches `cloudflared tunnel --url http://localhost:<port>`
+# as a subprocess, scrapes the public *.trycloudflare.com URL cloudflared
+# prints to stdout once the quick tunnel is live, and exposes it so the
+# dashboard's status page (and /api/status) can show/link it automatically.
+# ==============================================================================
+class CloudflareTunnel:
+    """Auto-publishes the local Flask dashboard through a Cloudflare quick
+    tunnel. Requires the `cloudflared` binary to be installed and reachable
+    (see CONFIG["tunnel"]["cloudflared_path"]). Degrades gracefully - same
+    pattern as every other optional piece of hardware/software in this file:
+    if cloudflared isn't found, it prints a clear warning and the dashboard
+    simply shows no public URL (local-only) instead of crashing."""
+
+    URL_RE = re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
+
+    def __init__(self, local_port: int, cloudflared_path: str = "cloudflared"):
+        self.local_port = local_port
+        self.cloudflared_path = cloudflared_path
+        self._lock = threading.Lock()
+        self._public_url = None
+        self._process = None
+        self._stop = False
+        self._reader_thread = None
+
+    @property
+    def public_url(self):
+        with self._lock:
+            return self._public_url
+
+    def start(self):
+        try:
+            self._process = subprocess.Popen(
+                [self.cloudflared_path, "tunnel", "--url", f"http://localhost:{self.local_port}"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            print(f"[CloudflareTunnel] '{self.cloudflared_path}' not found on PATH - "
+                  f"the dashboard will stay local-only. Install cloudflared: "
+                  f"https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
+            return
+        except Exception as e:
+            print(f"[CloudflareTunnel] failed to start: {e}")
+            return
+        self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
+        self._reader_thread.start()
+        print(f"[CloudflareTunnel] starting quick tunnel -> http://localhost:{self.local_port} ...")
+
+    def _read_output(self):
+        try:
+            for line in self._process.stdout:
+                if self._stop:
+                    break
+                m = self.URL_RE.search(line)
+                if m:
+                    with self._lock:
+                        if self._public_url is None:
+                            self._public_url = m.group(0)
+                            print(f"[CloudflareTunnel] public URL ready: {self._public_url}")
+        except Exception as e:
+            if not self._stop:
+                print(f"[CloudflareTunnel] reader thread error: {e}")
+
+    def stop(self):
+        self._stop = True
+        if self._process:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            print("[CloudflareTunnel] stopped.")
 
 
 # ==============================================================================
@@ -1640,6 +1729,11 @@ STATUS_PAGE = """
   .footer{margin-top:20px;color:#484f58;font-size:11px;}
   .barwrap{background:#0b0f14;border-radius:6px;height:8px;overflow:hidden;margin-top:8px;border:1px solid {{c.border}};}
   .barfill{height:100%;border-radius:6px;}
+  .pub-url-row{margin-top:10px;padding:10px 14px;background:#0b0f14;border:1px dashed {{c.border}};
+    border-radius:8px;font-size:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .pub-url-row .lbl{color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;font-size:10px;}
+  .pub-url-row a{color:{{c.green}};font-weight:bold;}
+  .pub-url-row .pending{color:{{c.amber}};}
 </style></head><body>
 """ + NAV_BAR.replace("{active_status}", "active").replace("{active_camera}", "") \
               .replace("{active_database}", "").replace("{active_labels}", "") + """
@@ -1690,6 +1784,15 @@ STATUS_PAGE = """
     <tr><td>mass (g)</td><td>{{pear_mass}}</td></tr>
   </table>
   {% else %}<div>No pears processed yet...</div>{% endif %}
+</div>
+
+<div class="pub-url-row">
+  <span class="lbl">Public URL (Cloudflare tunnel)</span>
+  {% if public_url %}
+    <a href="{{ public_url }}" target="_blank">{{ public_url }}</a>
+  {% else %}
+    <span class="pending">connecting via Cloudflare tunnel&hellip;</span>
+  {% endif %}
 </div>
 
 <div class="footer">
@@ -1951,7 +2054,7 @@ LABEL_PAGE = """
 
 def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
                      db_path: Path, camera_hardware_active: bool, cfg: dict,
-                     stream_buf: "VideoStreamBuffer"):
+                     stream_buf: "VideoStreamBuffer", tunnel: "CloudflareTunnel" = None):
     app = Flask(__name__)
     dash = cfg["dashboard"]
     colors = dash["colors"]
@@ -1976,6 +2079,7 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
             pear_surface_area=payload.get("pear_surface_area"),
             pear_volume=payload.get("pear_volume"), pear_mass=payload.get("pear_mass"),
             hardware_active=camera_hardware_active,
+            public_url=(tunnel.public_url if tunnel else None),
             now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     @app.route("/database")
@@ -1992,7 +2096,9 @@ def build_flask_app(dc_node: DataCollectionNode, speed_ctrl: SpeedController,
     @app.route("/api/status")
     def api_status():
         raw = dc_node.get_iot_status()
-        return jsonify(json.loads(raw) if raw else {})
+        payload = json.loads(raw) if raw else {}
+        payload["public_url"] = tunnel.public_url if tunnel else None
+        return jsonify(payload)
 
     @app.route("/camera")
     def camera_view():
@@ -2185,6 +2291,8 @@ def main():
     ap.add_argument("--db-path", type=str, default=rd["db_path"])
     ap.add_argument("--force-sim", action="store_true", default=rd["force_sim"],
                      help="ignore any hardware libraries even if present (dev/demo mode)")
+    ap.add_argument("--no-tunnel", action="store_true", default=rd["no_tunnel"],
+                     help="disable the automatic Cloudflare quick tunnel, even if enabled in CONFIG")
     args = ap.parse_args()
 
     global HAVE_REALSENSE, HAVE_GPIO, HAVE_SERVOKIT
@@ -2277,9 +2385,20 @@ def main():
                               daemon=True)
         t.start(); threads.append(t)
 
+    # T+5.8: Cloudflare quick tunnel - publishes the local dashboard publicly
+    tunnel_cfg = CONFIG["tunnel"]
+    tunnel = None
+    if not args.no_web and tunnel_cfg["enabled"] and not args.no_tunnel:
+        print("[SAAT] T+5.8: starting CloudflareTunnel (auto-publish dashboard)...")
+        tunnel = CloudflareTunnel(args.port, tunnel_cfg["cloudflared_path"])
+        tunnel.start()
+    elif not args.no_web:
+        print("[SAAT] T+5.8: Cloudflare tunnel disabled (CONFIG['tunnel']['enabled']=False or --no-tunnel).")
+
     # T+6: SCADA dashboard
     if not args.no_web:
-        app = build_flask_app(dc_node, speed_ctrl, db_path, camera.hardware_active, CONFIG, stream_buf)
+        app = build_flask_app(dc_node, speed_ctrl, db_path, camera.hardware_active, CONFIG,
+                               stream_buf, tunnel)
         t = threading.Thread(
             target=lambda: app.run(host="0.0.0.0", port=args.port, debug=False,
                                     use_reloader=False, threaded=True), daemon=True)
@@ -2290,6 +2409,9 @@ def main():
         print(f"[SAAT] Database  : http://localhost:{args.port}/database")
         print(f"[SAAT] Labels    : http://localhost:{args.port}/labels")
         print(f"[SAAT] JSON API  : http://localhost:{args.port}/api/status")
+        if tunnel is not None:
+            print("[SAAT] Public URL will appear on the Status page (and /api/status) "
+                  "once cloudflared connects, usually within a few seconds.")
     else:
         print("[SAAT] --no-web: dashboard disabled (headless mode).")
 
@@ -2307,6 +2429,8 @@ def main():
         stop_event.set()
         servo.stop()
         conv1.stop(); conv2.stop()
+        if tunnel is not None:
+            tunnel.stop()
         if HAVE_GPIO:
             GPIO.cleanup()
         camera.stop()
